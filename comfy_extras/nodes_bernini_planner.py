@@ -235,7 +235,14 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                 io.Int.Input("width", default=832, min=16, max=8192, step=16),
                 io.Int.Input("height", default=480, min=16, max=8192, step=16),
                 io.Int.Input("length", default=81, min=1, max=8192, step=4),
-                io.String.Input("neg_prompt", multiline=True, default="", optional=True),
+                io.Int.Input("vit_min_pixels", default=3136, min=256, max=1048576, advanced=True),
+                io.Int.Input("vit_max_pixels", default=50176, min=256, max=1048576, advanced=True),
+                io.String.Input(
+                    "neg_prompt",
+                    multiline=True,
+                    default="",
+                    tooltip="Planner uncond branch negative (official run_v2v.sh default).",
+                ),
                 io.Image.Input("source_video", optional=True, tooltip="Source video for v2v/rv2v."),
                 io.Autogrow.Input(
                     "reference_images",
@@ -247,8 +254,6 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                         max=8,
                     ),
                 ),
-                io.Int.Input("vit_min_pixels", default=3136, min=256, max=1048576, advanced=True),
-                io.Int.Input("vit_max_pixels", default=50176, min=256, max=1048576, advanced=True),
             ],
             outputs=[io.Custom("BERNINI_PLANNER_INPUTS").Output(display_name="planner_inputs")],
         )
