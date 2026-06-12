@@ -2,6 +2,7 @@
 """Bernini bernini_process_sample inference subset for ComfyUI."""
 
 import json
+import os
 import random
 from functools import partial
 from types import SimpleNamespace
@@ -112,15 +113,29 @@ def bernini_process_sample(
     return tokenized_example
 
 
-def make_position_id_func(mllm_path: str):
-    """Build Qwen2.5-VL rope index function from mllm config."""
-    config = AutoConfig.from_pretrained(mllm_path, trust_remote_code=True)
+def make_position_id_func_from_config(config):
+    """Build Qwen2.5-VL rope index function from a loaded config."""
     fake_model = SimpleNamespace(
         config=config,
         image_token_id=config.image_token_id,
         video_token_id=config.video_token_id,
     )
     return partial(Qwen2_5_VLModel.get_rope_index, fake_model)
+
+
+def make_position_id_func(mllm_path: str):
+    """Build Qwen2.5-VL rope index function from mllm config path or HF repo id."""
+    from comfy.bernini.mllm import BERNINI_DIFFUSERS_REPO, BERNINI_MLLM_SUBFOLDER
+
+    if os.path.isdir(mllm_path):
+        config = AutoConfig.from_pretrained(mllm_path, trust_remote_code=True)
+    elif mllm_path == BERNINI_DIFFUSERS_REPO:
+        config = AutoConfig.from_pretrained(
+            BERNINI_DIFFUSERS_REPO, subfolder=BERNINI_MLLM_SUBFOLDER, trust_remote_code=True
+        )
+    else:
+        config = AutoConfig.from_pretrained(mllm_path, trust_remote_code=True)
+    return make_position_id_func_from_config(config)
 
 
 def transform_planner_sample(

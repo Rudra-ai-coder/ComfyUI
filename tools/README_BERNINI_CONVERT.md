@@ -103,9 +103,13 @@ ComfyUI/models/
     wan_2.1_vae.safetensors
 ```
 
-Processor bundle (no weight shards):
+Processor bundle (no weight shards — **not** included in `bernini_mllm.safetensors`):
 
 ```bash
+# Option A: symlink your existing Bernini-Diffusers mllm/ folder
+ln -s /workspace/data/Bernini-Diffusers/mllm ComfyUI/models/bernini/mllm
+
+# Option B: copy tokenizer/preprocessor JSON only into mllm_processor/
 mkdir -p ComfyUI/models/bernini/mllm_processor
 hf download ByteDance/Bernini-Diffusers \
   --local-dir /tmp/bernini-mllm-meta \
@@ -113,6 +117,8 @@ hf download ByteDance/Bernini-Diffusers \
            "mllm/chat_template.json" "mllm/merges.txt" "mllm/vocab.json"
 cp /tmp/bernini-mllm-meta/mllm/* ComfyUI/models/bernini/mllm_processor/
 ```
+
+If neither local folder exists, ComfyUI auto-downloads processor metadata from `ByteDance/Bernini-Diffusers` (subfolder `mllm`) on first run.
 
 `BerniniMLLMLoader` picks `bernini_mllm.safetensors` from the dropdown; optional `hf_folder` overrides with a full HF `mllm/` directory.
 
