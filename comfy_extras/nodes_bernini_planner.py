@@ -134,7 +134,7 @@ class BerniniMLLMLoader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, weights, processor_folder="mllm_processor", hf_folder="") -> io.NodeOutput:
+    def execute(cls, weights, hf_folder="", processor_folder="mllm_processor") -> io.NodeOutput:
         path = hf_folder.strip() if hf_folder and hf_folder.strip() else weights
         mllm = BerniniMLLM.load(path, processor_path=processor_folder)
         return io.NodeOutput(mllm)

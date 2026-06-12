@@ -1684,20 +1684,20 @@
                 "link": null
               },
               {
-                "localized_name": "processor_folder",
-                "name": "processor_folder",
-                "type": "STRING",
-                "widget": {
-                  "name": "processor_folder"
-                },
-                "link": null
-              },
-              {
                 "localized_name": "hf_folder",
                 "name": "hf_folder",
                 "type": "STRING",
                 "widget": {
                   "name": "hf_folder"
+                },
+                "link": null
+              },
+              {
+                "localized_name": "processor_folder",
+                "name": "processor_folder",
+                "type": "STRING",
+                "widget": {
+                  "name": "processor_folder"
                 },
                 "link": null
               }
@@ -1719,8 +1719,8 @@
             },
             "widgets_values": [
               "bernini_mllm.safetensors",
-              "mllm_processor",
-              ""
+              "",
+              "mllm_processor"
             ]
           },
           {

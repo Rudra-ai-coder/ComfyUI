@@ -82,6 +82,13 @@ class BerniniMLLM:
         if os.path.isdir(path):
             return cls._load_hf_folder(path, device)
 
+        if not path.endswith(".safetensors"):
+            raise FileNotFoundError(
+                f"Bernini MLLM weights must be bernini_mllm.safetensors in models/bernini/, "
+                f"a .safetensors file path, or an HF mllm/ directory — got: {path!r}. "
+                f"Check BerniniMLLMLoader: hf_folder must be empty unless using a full mllm/ directory."
+            )
+
         weights_path = resolve_bernini_model_path(path)
         proc_dir = resolve_mllm_processor_dir(processor_path or DEFAULT_PROCESSOR_SUBDIR)
         if not os.path.isdir(proc_dir):
