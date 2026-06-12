@@ -1675,11 +1675,29 @@
             "mode": 0,
             "inputs": [
               {
-                "localized_name": "path",
-                "name": "path",
+                "localized_name": "weights",
+                "name": "weights",
+                "type": "COMBO",
+                "widget": {
+                  "name": "weights"
+                },
+                "link": null
+              },
+              {
+                "localized_name": "processor_folder",
+                "name": "processor_folder",
                 "type": "STRING",
                 "widget": {
-                  "name": "path"
+                  "name": "processor_folder"
+                },
+                "link": null
+              },
+              {
+                "localized_name": "hf_folder",
+                "name": "hf_folder",
+                "type": "STRING",
+                "widget": {
+                  "name": "hf_folder"
                 },
                 "link": null
               }
@@ -1695,12 +1713,14 @@
                 "localized_name": "mllm"
               }
             ],
-            "title": "Qwen2.5-VL (mllm/)",
+            "title": "Qwen2.5-VL (bernini_mllm)",
             "properties": {
               "Node name for S&R": "BerniniMLLMLoader"
             },
             "widgets_values": [
-              "/workspace/data/Bernini-Diffusers/mllm"
+              "bernini_mllm.safetensors",
+              "mllm_processor",
+              ""
             ]
           },
           {

@@ -75,11 +75,46 @@ Peak RAM ≈ size of one output bucket (+ small shard batch). Use `--dtype none`
 |------|-------------|-----|
 | `bernini_planner.safetensors` | `connector.*`, `mask_tokens` | Planner loader (upcoming nodes) |
 | `bernini_vit_decoder.safetensors` | `vit_decoder.*` | VIT flow decoder loader |
-| `bernini_mllm.safetensors` | `mllm.*` (prefix stripped) | Qwen2.5-VL weights from joint shard |
+| `bernini_mllm.safetensors` | `mllm.*` (prefix stripped) | `models/bernini/` + `BerniniMLLMLoader` |
 | `bernini_high_noise.safetensors` | `diff_dec.transformer.*` → Comfy keys | `UNETLoader` high-noise expert |
 | `bernini_low_noise.safetensors` | `diff_dec_low.transformer_2.*` → Comfy keys | `UNETLoader` low-noise expert |
 
 DiT outputs use ComfyUI `WanModel` key layout (`blocks.*.self_attn.q`, `head.modulation`, etc.) compatible with `UNETLoader` and Wan 2.2 blueprints.
+
+## Where to put converted files in ComfyUI
+
+```text
+ComfyUI/models/
+  bernini/
+    bernini_planner.safetensors
+    bernini_vit_decoder.safetensors
+    bernini_mllm.safetensors          # MLLM weights (from convert script)
+    mllm_processor/                   # tokenizer + preprocessor only (~few MB)
+      config.json
+      preprocessor_config.json
+      tokenizer.json
+      …
+  diffusion_models/
+    bernini_high_noise.safetensors
+    bernini_low_noise.safetensors
+  text_encoders/
+    umt5_xxl_fp8_e4m3fn_scaled.safetensors
+  vae/
+    wan_2.1_vae.safetensors
+```
+
+Processor bundle (no weight shards):
+
+```bash
+mkdir -p ComfyUI/models/bernini/mllm_processor
+hf download ByteDance/Bernini-Diffusers \
+  --local-dir /tmp/bernini-mllm-meta \
+  --include "mllm/config.json" "mllm/preprocessor_config.json" "mllm/tokenizer*" \
+           "mllm/chat_template.json" "mllm/merges.txt" "mllm/vocab.json"
+cp /tmp/bernini-mllm-meta/mllm/* ComfyUI/models/bernini/mllm_processor/
+```
+
+`BerniniMLLMLoader` picks `bernini_mllm.safetensors` from the dropdown; optional `hf_folder` overrides with a full HF `mllm/` directory.
 
 ## Verify UNET load (after conversion)
 

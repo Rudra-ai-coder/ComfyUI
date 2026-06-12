@@ -4,6 +4,7 @@
 import logging
 import os
 
+import folder_paths
 import comfy.model_management
 import node_helpers
 import torch
@@ -75,7 +76,7 @@ class BerniniPlannerEmbeds:
 
 def _load_split_state_dict(path: str) -> dict:
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
+        path = folder_paths.get_full_path_or_raise("bernini", path)
     return load_file(path, device="cpu")
 
 
@@ -106,21 +107,36 @@ class BerniniMLLMLoader(io.ComfyNode):
             node_id="BerniniMLLMLoader",
             display_name="Bernini MLLM Loader",
             category="loaders/bernini",
-            description="Load Qwen2.5-VL-7B from Bernini-Diffusers mllm/ folder (HF layout). "
-                        "Model stays on CPU until planning nodes request GPU.",
+            description="Load Qwen2.5-VL-7B from models/bernini/bernini_mllm.safetensors "
+                        "(convert script output) or a full HF mllm/ directory path. "
+                        "Tokenizer/processor: models/bernini/mllm_processor/ (no weights).",
             inputs=[
+                io.Combo.Input(
+                    "weights",
+                    options=folder_paths.get_filename_list("bernini"),
+                    tooltip="Place in ComfyUI/models/bernini/. Use bernini_mllm.safetensors from convert script.",
+                ),
                 io.String.Input(
-                    "path",
-                    default="mllm",
-                    tooltip="Path to mllm/ subfolder (Qwen2.5-VL-7B HF weights + processor).",
+                    "hf_folder",
+                    default="",
+                    optional=True,
+                    tooltip="Optional: absolute path to full HF mllm/ folder (overrides weights combo).",
+                ),
+                io.String.Input(
+                    "processor_folder",
+                    default="mllm_processor",
+                    optional=True,
+                    tooltip="Subfolder under models/bernini/ with tokenizer + preprocessor JSON "
+                            "(no weight shards). Download from Bernini-Diffusers mllm/ or Qwen hub.",
                 ),
             ],
             outputs=[io.Custom("BERNINI_MLLM").Output(display_name="mllm")],
         )
 
     @classmethod
-    def execute(cls, path) -> io.NodeOutput:
-        mllm = BerniniMLLM.load(path)
+    def execute(cls, weights, processor_folder="mllm_processor", hf_folder="") -> io.NodeOutput:
+        path = hf_folder.strip() if hf_folder and hf_folder.strip() else weights
+        mllm = BerniniMLLM.load(path, processor_path=processor_folder)
         return io.NodeOutput(mllm)
 
 
