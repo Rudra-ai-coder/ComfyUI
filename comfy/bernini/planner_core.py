@@ -134,6 +134,23 @@ def sample_vit_embed(
     """MaskGIT planning loop ported from BerniniPipeline.sample_vit_embed."""
     device = input_embeds.device
 
+    def _bool_mask(m):
+        """Convert (B, L, L) float 0/-inf mask → (B, 1, L, L) bool for HF v5 SDPA.
+
+        HF transformers ≥5 passes attention_mask through create_causal_mask →
+        sdpa_mask → and_mask which does `causal_bool & our_mask`.  Bitwise AND
+        is only defined for bool tensors, so a float mask raises:
+          NotImplementedError: "bitwise_and_cuda" not implemented for 'Float'.
+        Converting to bool (True = attend, False = masked) fixes this; PyTorch
+        SDPA then treats True positions as attended.
+        """
+        if m is None:
+            return None
+        b = (m > float("-inf"))       # (B, L, L) bool
+        if b.dim() == 3:
+            b = b.unsqueeze(1)         # (B, 1, L, L)
+        return b
+
     def mask_ratio_generator_infer(step, totals):
         return np.cos(math.pi / 2.0 * (step + 1) / totals)
 
@@ -160,19 +177,19 @@ def sample_vit_embed(
             hidden_state = mllm(
                 inputs_embeds=input_embeds.clone(),
                 position_ids=position_ids.clone(),
-                attention_mask=attention_mask_4d.clone(),
+                attention_mask=_bool_mask(attention_mask_4d),
                 output_hidden_states=True,
             ).hidden_states[-2]
             uncond_hidden_state = mllm(
                 inputs_embeds=uncond_input_embeds.clone(),
                 position_ids=uncond_position_ids.clone(),
-                attention_mask=uncond_attention_mask_4d.clone(),
+                attention_mask=_bool_mask(uncond_attention_mask_4d),
                 output_hidden_states=True,
             ).hidden_states[-2]
             imgcond_hidden_state = mllm(
                 inputs_embeds=imgcond_input_embeds.clone(),
                 position_ids=imgcond_position_ids.clone(),
-                attention_mask=imgcond_attention_mask_4d.clone(),
+                attention_mask=_bool_mask(imgcond_attention_mask_4d),
                 output_hidden_states=True,
             ).hidden_states[-2]
 
@@ -231,13 +248,13 @@ def sample_vit_embed(
     outputs = mllm(
         inputs_embeds=input_embeds.clone(),
         position_ids=position_ids.clone(),
-        attention_mask=attention_mask_4d.clone(),
+        attention_mask=_bool_mask(attention_mask_4d),
         output_hidden_states=True,
     )
     uncond_outputs = mllm(
         inputs_embeds=uncond_input_embeds.clone(),
         position_ids=uncond_position_ids.clone(),
-        attention_mask=uncond_attention_mask_4d.clone(),
+        attention_mask=_bool_mask(uncond_attention_mask_4d),
         output_hidden_states=True,
     )
 
