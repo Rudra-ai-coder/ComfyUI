@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bernini planner stack loaders + Phase 3 planning pipeline nodes."""
 
+import json
 import logging
 import os
 
@@ -10,7 +11,8 @@ import node_helpers
 import torch
 from comfy.bernini.text import extract_cross_attn, merge_t5_planner, set_merged_conditioning
 from comfy.ldm.bernini import DiffLoss_FM, MLPConnector
-from safetensors.torch import load_file
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from typing_extensions import override
 
 from comfy.bernini.mllm import BerniniMLLM
@@ -471,6 +473,7 @@ class BerniniSemanticPlanning(io.ComfyNode):
         imgcond_inputs = data["imgcond_inputs"]
 
         def _prepare_branch(branch):
+            # format_mllm_inputs_embeds receives input_ids [1, seq] and returns [1, seq, hidden]
             input_embeds = format_mllm_inputs_embeds(
                 mllm.model,
                 branch["input_ids"].unsqueeze(0),
@@ -478,12 +481,14 @@ class BerniniSemanticPlanning(io.ComfyNode):
                 branch["visual_input_token_mask"],
                 branch["visual_output_token_mask"],
             )
+            # post_process_input_embeds expects [batch, seq, hidden] — pass as-is (already [1, seq, hidden])
             post = post_process_input_embeds(
-                input_embeds.unsqueeze(0),
+                input_embeds,
                 branch["visual_output_token_mask"],
                 planner.mask_tokens,
                 inference=True,
             )
+            # squeeze batch dim so callers can .unsqueeze(0) again for the MLLM forward
             return post["input_embeds"].squeeze(0)
 
         inputs_embed = _prepare_branch(inputs)
@@ -588,6 +593,155 @@ class BerniniMergePlannerText(io.ComfyNode):
         return io.NodeOutput(positive, negative)
 
 
+# ---------------------------------------------------------------------------
+# Planner-inputs save / load (precompute VIT features offline)
+# ---------------------------------------------------------------------------
+
+_BOOL_KEYS_META = "__bool_keys__"
+_BRANCHES = ("inputs", "uncond_inputs", "imgcond_inputs")
+
+
+def _planner_cache_dir() -> str:
+    roots = folder_paths.get_folder_paths("bernini") or []
+    base = os.path.join(roots[0], "planner_cache") if roots else os.path.join(folder_paths.models_dir, "bernini", "planner_cache")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _resolve_bpi_path(path: str) -> str:
+    path = path.strip()
+    if not path:
+        return ""
+    if not path.endswith(".bpi"):
+        path += ".bpi"
+    if os.path.isabs(path) or os.path.isfile(path):
+        return path
+    candidate = os.path.join(_planner_cache_dir(), path)
+    return candidate
+
+
+def _flatten_bpi(data: dict) -> tuple[dict, dict]:
+    """Flatten nested planner-inputs dict → flat {key: tensor} + string metadata."""
+    tensors: dict[str, torch.Tensor] = {}
+    metadata: dict[str, str] = {"task_name": str(data.get("task_name", "v2v"))}
+    bool_keys: list[str] = []
+
+    for branch in _BRANCHES:
+        for key, val in data.get(branch, {}).items():
+            flat = f"{branch}__{key}"
+            if isinstance(val, torch.Tensor):
+                if val.dtype == torch.bool:
+                    tensors[flat] = val.cpu().to(torch.uint8)
+                    bool_keys.append(flat)
+                else:
+                    tensors[flat] = val.cpu()
+            elif isinstance(val, str):
+                metadata[flat] = val
+
+    metadata[_BOOL_KEYS_META] = json.dumps(bool_keys)
+    return tensors, metadata
+
+
+def _unflatten_bpi(tensors: dict, metadata: dict) -> dict:
+    bool_keys = set(json.loads(metadata.get(_BOOL_KEYS_META, "[]")))
+    data: dict = {"task_name": metadata.get("task_name", "v2v")}
+
+    for branch in _BRANCHES:
+        prefix = f"{branch}__"
+        branch_dict: dict = {}
+        for flat, tensor in tensors.items():
+            if flat.startswith(prefix):
+                k = flat[len(prefix):]
+                branch_dict[k] = tensor.to(torch.bool) if flat in bool_keys else tensor
+        for flat, val in metadata.items():
+            if flat.startswith(prefix):
+                branch_dict[flat[len(prefix):]] = val
+        data[branch] = branch_dict
+
+    return data
+
+
+class BerniniSavePlannerInputs(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="BerniniSavePlannerInputs",
+            display_name="Bernini Save Planner Inputs",
+            category="conditioning/bernini",
+            description="Save BerniniPreparePlannerInputs tensors to disk (.bpi file inside "
+                        "models/bernini/planner_cache/). Use BerniniLoadPlannerInputs to skip "
+                        "MLLM visual encoding on subsequent runs.",
+            inputs=[
+                io.Custom("BERNINI_PLANNER_INPUTS").Input("planner_inputs"),
+                io.String.Input(
+                    "filename",
+                    default="scene_01",
+                    tooltip="Saved as models/bernini/planner_cache/<filename>.bpi  "
+                            "(or use an absolute path).",
+                ),
+            ],
+            outputs=[
+                io.Custom("BERNINI_PLANNER_INPUTS").Output(display_name="planner_inputs"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, planner_inputs: BerniniPlannerInputs, filename: str) -> io.NodeOutput:
+        path = _resolve_bpi_path(filename)
+        tensors, metadata = _flatten_bpi(planner_inputs.data)
+        save_file(tensors, path, metadata=metadata)
+        LOG.info("Bernini planner inputs saved → %s  (%d tensors)", path, len(tensors))
+        return io.NodeOutput(planner_inputs)
+
+
+class BerniniLoadPlannerInputs(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="BerniniLoadPlannerInputs",
+            display_name="Bernini Load Planner Inputs",
+            category="conditioning/bernini",
+            description="Load pre-saved planner inputs from a .bpi file — skips MLLM visual "
+                        "encoding entirely. Pair with BerniniSavePlannerInputs.",
+            inputs=[
+                io.String.Input(
+                    "path",
+                    default="scene_01",
+                    tooltip="Filename (without .bpi) inside models/bernini/planner_cache/, "
+                            "or an absolute file path.",
+                ),
+            ],
+            outputs=[
+                io.Custom("BERNINI_PLANNER_INPUTS").Output(display_name="planner_inputs"),
+            ],
+        )
+
+    @classmethod
+    def IS_CHANGED(cls, path: str):
+        resolved = _resolve_bpi_path(path)
+        if resolved and os.path.isfile(resolved):
+            return str(os.path.getmtime(resolved))
+        return float("nan")
+
+    @classmethod
+    def execute(cls, path: str) -> io.NodeOutput:
+        resolved = _resolve_bpi_path(path)
+        if not resolved or not os.path.isfile(resolved):
+            raise FileNotFoundError(
+                f"Bernini planner inputs file not found: {path!r}\n"
+                f"Expected at: {resolved}\n"
+                f"Run BerniniPreparePlannerInputs → BerniniSavePlannerInputs first."
+            )
+        tensors: dict[str, torch.Tensor] = {}
+        with safe_open(resolved, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+            for key in f.keys():
+                tensors[key] = f.get_tensor(key)
+        data = _unflatten_bpi(tensors, metadata)
+        LOG.info("Bernini planner inputs loaded ← %s  (%d tensors)", resolved, len(tensors))
+        return io.NodeOutput(BerniniPlannerInputs(data))
+
+
 class BerniniPlannerExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -596,6 +750,8 @@ class BerniniPlannerExtension(ComfyExtension):
             BerniniPlannerLoader,
             BerniniVitDecoderLoader,
             BerniniPreparePlannerInputs,
+            BerniniSavePlannerInputs,
+            BerniniLoadPlannerInputs,
             BerniniSemanticPlanning,
             BerniniMergePlannerText,
         ]
