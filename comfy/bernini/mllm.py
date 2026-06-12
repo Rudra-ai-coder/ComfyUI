@@ -19,14 +19,23 @@ BERNINI_DIFFUSERS_REPO = "ByteDance/Bernini-Diffusers"
 BERNINI_MLLM_SUBFOLDER = "mllm"
 MLLM_HUB_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_PROCESSOR_SUBDIR = "mllm_processor"
-# Qwen2.5-VL-7B bf16 ≈ 14GB — used for text_encoder_initial_device heuristics.
+# Qwen2.5-VL-7B bf16 ≈ 14GB — used for load-device heuristics.
 MLLM_WEIGHT_BYTES = 14 * 1024 ** 3
+
+# One BerniniMLLM per (weights path, processor folder) for the ComfyUI process.
+_MLLM_CACHE: dict[tuple[str, str], "BerniniMLLM"] = {}
 
 
 def _mllm_load_device():
-    """Where to place MLLM weights for planning (GPU when VRAM allows, like CLIP/T5)."""
+    """GPU when VRAM allows (prefer direct GPU read over CPU staging)."""
     load_device = comfy.model_management.text_encoder_device()
     offload_device = comfy.model_management.text_encoder_offload_device()
+    if comfy.model_management.args.gpu_only:
+        return load_device
+    if load_device.type == "cuda":
+        free = comfy.model_management.get_free_memory(load_device)
+        if free > MLLM_WEIGHT_BYTES * 1.15:
+            return load_device
     return comfy.model_management.text_encoder_initial_device(
         load_device, offload_device, model_size=MLLM_WEIGHT_BYTES
     )
@@ -130,9 +139,9 @@ def _create_qwen_mllm_from_config(config, dtype=torch.bfloat16):
     from transformers import Qwen2_5_VLForConditionalGeneration
 
     if hasattr(Qwen2_5_VLForConditionalGeneration, "_from_config"):
-        return Qwen2_5_VLForConditionalGeneration._from_config(config, torch_dtype=dtype)
+        return Qwen2_5_VLForConditionalGeneration._from_config(config, dtype=dtype)
     if hasattr(Qwen2_5_VLForConditionalGeneration, "from_config"):
-        return Qwen2_5_VLForConditionalGeneration.from_config(config, torch_dtype=dtype)
+        return Qwen2_5_VLForConditionalGeneration.from_config(config, dtype=dtype)
     model = Qwen2_5_VLForConditionalGeneration(config)
     return model.to(dtype=dtype)
 
@@ -149,12 +158,13 @@ def _remap_bernini_mllm_state_dict(state_dict: dict) -> dict:
 
 
 def _extract_visual_embeds(output) -> torch.Tensor:
+    """HF transformers visual returns BaseModelOutputWithPooling: pooler_output is post-merger (official Bernini path)."""
     if torch.is_tensor(output):
         return output
-    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
-        return output.last_hidden_state
     if hasattr(output, "pooler_output") and output.pooler_output is not None:
         return output.pooler_output
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state
     raise TypeError(f"Unexpected Qwen2.5-VL visual forward output type: {type(output)}")
 
 
@@ -166,42 +176,109 @@ def _get_visual_module(model):
     raise AttributeError("Could not find Qwen2.5-VL visual module on MLLM model")
 
 
+def _mllm_cache_key(path: str, processor_name: str) -> tuple[str, str]:
+    proc = processor_name or DEFAULT_PROCESSOR_SUBDIR
+    if os.path.isdir(path):
+        return (os.path.abspath(path), proc)
+    return (resolve_bernini_model_path(path), proc)
+
+
 class BerniniMLLM:
     """Qwen2.5-VL-7B from bernini_mllm.safetensors + processor metadata, or full HF mllm/ folder."""
 
-    def __init__(self, model, processor, path: str, config_path: str, mllm_config):
-        self.model = model
+    def __init__(
+        self,
+        processor,
+        config,
+        config_path: str,
+        weights_path: Optional[str] = None,
+        hf_folder_path: Optional[str] = None,
+        model=None,
+    ):
         self.processor = processor
-        self.path = path
+        self._mllm_config = config
         self.config_path = config_path
-        self._mllm_config = mllm_config
+        self._weights_path = weights_path
+        self._hf_folder_path = hf_folder_path
+        self.path = weights_path or hf_folder_path or config_path
+        self.model = model
+        self._weights_loaded = model is not None
         self.dtype = torch.bfloat16
 
     @classmethod
-    def load(
-        cls,
-        path: str,
-        processor_path: Optional[str] = None,
-        device=None,
-    ):
-        from transformers import Qwen2_5_VLForConditionalGeneration
+    def open(cls, path: str, processor_path: Optional[str] = None):
+        """
+        Fast open: processor/config only. ~15GB weights load on first ensure_weights_on_device().
+        Cached per process so re-queued workflows skip disk I/O after the first planning pass.
+        """
+        key = _mllm_cache_key(path, processor_path or DEFAULT_PROCESSOR_SUBDIR)
+        cached = _MLLM_CACHE.get(key)
+        if cached is not None:
+            LOG.info("Reusing cached Bernini MLLM (%s)", key[0])
+            return cached
 
-        if device is None:
-            device = _mllm_load_device()
-
+        processor_name = processor_path or DEFAULT_PROCESSOR_SUBDIR
         if os.path.isdir(path):
-            return cls._load_hf_folder(path, device)
-
-        if not path.endswith(".safetensors"):
-            raise FileNotFoundError(
-                f"Bernini MLLM weights must be bernini_mllm.safetensors in models/bernini/, "
-                f"a .safetensors path, or an HF mllm/ directory — got: {path!r}. "
-                f"Leave hf_folder empty on BerniniMLLMLoader when using the safetensors file."
+            processor, config, config_path = _load_processor_and_config(processor_name)
+            hf_path = os.path.abspath(path)
+            LOG.info(
+                "Bernini MLLM opened from HF folder %s (weights deferred until planning)",
+                hf_path,
+            )
+            inst = cls(
+                processor=processor,
+                config=config,
+                config_path=config_path,
+                hf_folder_path=hf_path,
+            )
+        else:
+            weights_path = resolve_bernini_model_path(path)
+            processor, config, config_path = _load_processor_and_config(processor_name)
+            size_gb = os.path.getsize(weights_path) / (1024 ** 3)
+            LOG.info(
+                "Bernini MLLM opened (%s, %.1f GB on disk — weights deferred until planning)",
+                weights_path,
+                size_gb,
+            )
+            inst = cls(
+                processor=processor,
+                config=config,
+                config_path=config_path,
+                weights_path=weights_path,
             )
 
-        weights_path = resolve_bernini_model_path(path)
-        processor, config, config_path = _load_processor_and_config(processor_path or DEFAULT_PROCESSOR_SUBDIR)
+        _MLLM_CACHE[key] = inst
+        return inst
 
+    @classmethod
+    def load(cls, path: str, processor_path: Optional[str] = None, device=None):
+        """Load weights immediately (legacy). Prefer open() + ensure_weights_on_device()."""
+        mllm = cls.open(path, processor_path=processor_path)
+        mllm.ensure_weights_on_device(device)
+        return mllm
+
+    def ensure_weights_on_device(self, device=None):
+        """Load weights from disk on first call; later calls only move between devices."""
+        if device is None:
+            device = _mllm_load_device()
+        if not self._weights_loaded:
+            self._load_weights(device)
+            return
+        if self.model is not None and self.model.device != device:
+            self.model.to(device)
+
+    def _load_weights(self, device):
+        if self._hf_folder_path is not None:
+            self._load_hf_weights(self._hf_folder_path, device)
+            return
+
+        if not self._weights_path or not self._weights_path.endswith(".safetensors"):
+            raise FileNotFoundError(
+                f"Bernini MLLM weights must be bernini_mllm.safetensors in models/bernini/, "
+                f"a .safetensors path, or an HF mllm/ directory — got: {self._weights_path!r}."
+            )
+
+        weights_path = self._weights_path
         size_gb = os.path.getsize(weights_path) / (1024 ** 3)
         sd_device = _safetensors_device(device)
         LOG.info(
@@ -211,7 +288,11 @@ class BerniniMLLM:
             device,
             sd_device,
         )
-        model = _create_qwen_mllm_from_config(config, dtype=torch.bfloat16)
+
+        if device.type == "cuda":
+            comfy.model_management.soft_empty_cache()
+
+        model = _create_qwen_mllm_from_config(self._mllm_config, dtype=torch.bfloat16)
         if device.type != "cpu":
             model = model.to(device=device)
 
@@ -233,15 +314,14 @@ class BerniniMLLM:
             p.requires_grad_(False)
         if device.type == "cpu":
             model.to(device)
-        return cls(model, processor, weights_path, config_path, config)
 
-    @classmethod
-    def _load_hf_folder(cls, path: str, device):
-        from transformers import AutoConfig, AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        self.model = model
+        self._weights_loaded = True
+
+    def _load_hf_weights(self, path: str, device):
+        from transformers import Qwen2_5_VLForConditionalGeneration
 
         LOG.info("Loading Bernini MLLM from HF folder %s -> %s", path, device)
-        processor = AutoProcessor.from_pretrained(path, padding_side="right", trust_remote_code=True)
-        config = AutoConfig.from_pretrained(path, trust_remote_code=True)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             path,
             torch_dtype=torch.bfloat16,
@@ -251,9 +331,11 @@ class BerniniMLLM:
         for p in model.parameters():
             p.requires_grad_(False)
         model.to(device)
-        return cls(model, processor, path, path, config)
+        self.model = model
+        self._weights_loaded = True
 
     def to(self, device, dtype=None):
+        self.ensure_weights_on_device(device)
         if dtype is None:
             dtype = self.dtype
         self.model.to(device=device, dtype=dtype)
@@ -261,6 +343,7 @@ class BerniniMLLM:
 
     @torch.no_grad()
     def get_vit_features(self, pixel_values, grid_thw) -> Tuple[torch.Tensor, ...]:
+        self.ensure_weights_on_device()
         visual = _get_visual_module(self.model)
         pixel_values = pixel_values.type(self.model.dtype).to(self.model.device)
         grid_thw = grid_thw.to(self.model.device)
@@ -328,5 +411,7 @@ class BerniniMLLM:
         return make_position_id_func_from_config(self._mllm_config)
 
     def offload(self):
+        if not self._weights_loaded or self.model is None:
+            return
         self.to(comfy.model_management.text_encoder_offload_device())
         comfy.model_management.soft_empty_cache()

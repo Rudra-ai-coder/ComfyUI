@@ -107,11 +107,10 @@ class BerniniMLLMLoader(io.ComfyNode):
             node_id="BerniniMLLMLoader",
             display_name="Bernini MLLM Loader",
             category="loaders/bernini",
-            description="Load Qwen2.5-VL-7B from models/bernini/bernini_mllm.safetensors "
-                        "(convert script output) or a full HF mllm/ directory path. "
-                        "Loads to GPU when VRAM allows (same rules as text encoders); "
-                        "offloads to CPU after planning nodes. "
-                        "Tokenizer/processor: models/bernini/mllm_processor/ (no weights).",
+            description="Open Qwen2.5-VL-7B (processor only — instant). ~15GB weights load on first "
+                        "BerniniPreparePlannerInputs / SemanticPlanning, then stay cached in RAM for "
+                        "re-queued runs. GPU direct read when VRAM allows. "
+                        "Tokenizer: models/bernini/mllm/ or mllm_processor/.",
             inputs=[
                 io.Combo.Input(
                     "weights",
@@ -138,7 +137,7 @@ class BerniniMLLMLoader(io.ComfyNode):
     @classmethod
     def execute(cls, weights, hf_folder="", processor_folder="mllm_processor") -> io.NodeOutput:
         path = hf_folder.strip() if hf_folder and hf_folder.strip() else weights
-        mllm = BerniniMLLM.load(path, processor_path=processor_folder)
+        mllm = BerniniMLLM.open(path, processor_path=processor_folder)
         return io.NodeOutput(mllm)
 
 
