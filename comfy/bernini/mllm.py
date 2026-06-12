@@ -2,6 +2,7 @@
 """Bernini Qwen2.5-VL-7B MLLM wrapper (HF folder or bernini_mllm.safetensors)."""
 
 import logging
+import math
 import os
 from typing import List, Optional, Tuple, Union
 
@@ -52,15 +53,33 @@ def _tensor_to_pil(image_tensor: torch.Tensor) -> PIL.Image.Image:
     return PIL.Image.fromarray(arr)
 
 
-def _sample_video_frames(video: torch.Tensor, max_frames: int, frame_factor: int = 2) -> List[PIL.Image.Image]:
+def _sample_video_frames(
+    video: torch.Tensor,
+    max_frames: int,
+    video_fps: int = 16,
+    vit_fps: int = 2,
+    frame_factor: int = 2,
+) -> List[PIL.Image.Image]:
+    """Sample frames for VIT encoding using fps-aware sub-sampling.
+
+    Mirrors the official pipeline's smart_video_nframes logic:
+      target = total_frames * vit_fps / video_fps
+    then snapped to a multiple of frame_factor and clamped to [frame_factor, max_frames].
+    """
     total = video.shape[0]
-    if total <= max_frames:
+    if video_fps > 0 and vit_fps > 0 and video_fps != vit_fps:
+        raw = total * vit_fps / video_fps
+        target = int(math.floor(raw / frame_factor)) * frame_factor
+        target = max(frame_factor, min(target, max_frames, total))
+    else:
+        # No fps sub-sampling: keep all frames up to max, snapped to frame_factor
+        target = (min(total, max_frames) // frame_factor) * frame_factor
+        target = max(frame_factor, target)
+
+    if target >= total:
         indices = list(range(total))
     else:
-        indices = np.linspace(0, total - 1, max_frames).astype(int).tolist()
-    if frame_factor > 1 and len(indices) > 1:
-        n = (len(indices) // frame_factor) * frame_factor
-        indices = indices[: max(n, frame_factor)]
+        indices = np.linspace(0, total - 1, target).astype(int).tolist()
     return [_tensor_to_pil(video[i]) for i in indices]
 
 
@@ -404,6 +423,7 @@ class BerniniMLLM:
         vit_min_pixels: int = 3136,
         vit_max_pixels: int = 50176,
         vit_fps: int = 2,
+        video_fps: int = 16,
         max_frames: int = 81,
     ):
         if not videos:
@@ -411,7 +431,13 @@ class BerniniMLLM:
         all_embeds = []
         all_grids = []
         for video in videos:
-            frames = _sample_video_frames(video, max_frames=max_frames, frame_factor=2)
+            frames = _sample_video_frames(
+                video,
+                max_frames=max_frames,
+                video_fps=video_fps,
+                vit_fps=vit_fps,
+                frame_factor=2,
+            )
             video_inputs = self.processor.video_processor(
                 videos=[frames],
                 return_tensors="pt",

@@ -244,6 +244,12 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                 io.Int.Input("vit_max_pixels", default=25088, min=256, max=1048576, advanced=True,
                              tooltip="Max pixels per frame/image (lower = faster encode). "
                                      "Official default ~50176; 25088 is a good speed/quality trade-off."),
+                io.Int.Input("video_fps", default=16, min=1, max=120, advanced=True,
+                             tooltip="FPS of the input source_video tensor (typically matches your vae_fps). "
+                                     "Used to compute how many frames to sub-sample for VIT encoding."),
+                io.Int.Input("vit_fps", default=2, min=1, max=30, advanced=True,
+                             tooltip="Target FPS for VIT visual encoding (official default 2). "
+                                     "Frames sent to VIT = total_frames × vit_fps / video_fps."),
                 io.String.Input(
                     "neg_prompt",
                     multiline=True,
@@ -279,11 +285,14 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         reference_images=None,
         vit_min_pixels=3136,
         vit_max_pixels=25088,
+        video_fps=16,
+        vit_fps=2,
     ):
         import hashlib, struct
         h = hashlib.md5()
         for v in (prompt, task_name, str(width), str(height), str(length),
-                  neg_prompt, str(vit_min_pixels), str(vit_max_pixels)):
+                  neg_prompt, str(vit_min_pixels), str(vit_max_pixels),
+                  str(video_fps), str(vit_fps)):
             h.update(v.encode())
         if source_video is not None:
             h.update(struct.pack("q", source_video.shape[0]))
@@ -311,6 +320,8 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         reference_images=None,
         vit_min_pixels=3136,
         vit_max_pixels=25088,
+        video_fps=16,
+        vit_fps=2,
     ) -> io.NodeOutput:
         load_device = comfy.model_management.text_encoder_device()
         LOG.info("BerniniPreparePlannerInputs: loading MLLM to %s", load_device)
@@ -329,14 +340,18 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         source_video_ve, source_video_vg = None, None
         if source_video is not None:
             num_videos = 1
+            vit_frames = max(2, int(source_video.shape[0] * vit_fps / max(video_fps, 1)) // 2 * 2)
             LOG.info(
-                "BerniniPreparePlannerInputs: encoding source video (%d frames, vit_max_pixels=%d)",
-                source_video.shape[0], vit_max_pixels,
+                "BerniniPreparePlannerInputs: encoding source video (%d frames @ %dfps "
+                "→ %d VIT frames @ %dfps, vit_max_pixels=%d)",
+                source_video.shape[0], video_fps, vit_frames, vit_fps, vit_max_pixels,
             )
             source_video_ve, source_video_vg = mllm.encode_videos(
                 [source_video],
                 vit_min_pixels=vit_min_pixels,
                 vit_max_pixels=vit_max_pixels,
+                vit_fps=vit_fps,
+                video_fps=video_fps,
                 max_frames=length,
             )
             video_embeds.extend(source_video_ve)
@@ -384,6 +399,8 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                     [fake_vid],
                     vit_min_pixels=vit_min_pixels,
                     vit_max_pixels=vit_max_pixels,
+                    vit_fps=vit_fps,
+                    video_fps=video_fps,
                     max_frames=length,
                 )
             video_embeds.extend(ve)
