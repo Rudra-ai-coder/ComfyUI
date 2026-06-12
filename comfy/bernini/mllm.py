@@ -270,15 +270,26 @@ class BerniniMLLM:
         mllm.ensure_weights_on_device(device)
         return mllm
 
+    def _current_device(self) -> Optional[torch.device]:
+        if self.model is None:
+            return None
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return None
+
     def ensure_weights_on_device(self, device=None):
-        """Load weights from disk on first call; later calls only move between devices."""
+        """Load weights from disk on first call; later calls only move between devices (skip if already there)."""
         if device is None:
             device = _mllm_load_device()
         if not self._weights_loaded:
             self._load_weights(device)
             return
-        if self.model is not None and self.model.device != device:
-            self.model.to(device)
+        if self.model is not None:
+            cur = self._current_device()
+            if cur is None or cur.type != device.type or (device.type == "cuda" and cur.index != device.index):
+                LOG.info("MLLM: moving %s → %s", cur, device)
+                self.model.to(device)
 
     def _load_weights(self, device):
         if self._hf_folder_path is not None:

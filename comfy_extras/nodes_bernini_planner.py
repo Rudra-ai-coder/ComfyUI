@@ -228,7 +228,8 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
             display_name="Bernini Prepare Planner Inputs",
             category="conditioning/bernini",
             description="Pack prompt + optional images/video into Bernini planner tensors "
-                        "(cond / uncond / imgcond branches). Outputs CPU tensors.",
+                        "(cond / uncond / imgcond branches). Outputs CPU tensors. "
+                        "MLLM is intentionally left on GPU so SemanticPlanning starts immediately.",
             inputs=[
                 io.Custom("BERNINI_MLLM").Input("mllm"),
                 io.String.Input("prompt", multiline=True, default=""),
@@ -236,8 +237,11 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                 io.Int.Input("width", default=832, min=16, max=8192, step=16),
                 io.Int.Input("height", default=480, min=16, max=8192, step=16),
                 io.Int.Input("length", default=81, min=1, max=8192, step=4),
-                io.Int.Input("vit_min_pixels", default=3136, min=256, max=1048576, advanced=True),
-                io.Int.Input("vit_max_pixels", default=50176, min=256, max=1048576, advanced=True),
+                io.Int.Input("vit_min_pixels", default=3136, min=256, max=1048576, advanced=True,
+                             tooltip="Min pixels per frame/image fed to Qwen VIT."),
+                io.Int.Input("vit_max_pixels", default=25088, min=256, max=1048576, advanced=True,
+                             tooltip="Max pixels per frame/image (lower = faster encode). "
+                                     "Official default ~50176; 25088 is a good speed/quality trade-off."),
                 io.String.Input(
                     "neg_prompt",
                     multiline=True,
@@ -260,6 +264,38 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         )
 
     @classmethod
+    def IS_CHANGED(
+        cls,
+        mllm,
+        prompt,
+        task_name,
+        width,
+        height,
+        length,
+        neg_prompt="",
+        source_video=None,
+        reference_images=None,
+        vit_min_pixels=3136,
+        vit_max_pixels=25088,
+    ):
+        import hashlib, struct
+        h = hashlib.md5()
+        for v in (prompt, task_name, str(width), str(height), str(length),
+                  neg_prompt, str(vit_min_pixels), str(vit_max_pixels)):
+            h.update(v.encode())
+        if source_video is not None:
+            h.update(struct.pack("q", source_video.shape[0]))
+            step = max(1, source_video.shape[0] // 8)
+            h.update(source_video[::step].cpu().numpy().tobytes())
+        if reference_images:
+            for name in sorted(reference_images):
+                imgs = reference_images[name]
+                if imgs is not None:
+                    h.update(name.encode())
+                    h.update(imgs.cpu().numpy().tobytes())
+        return h.hexdigest()
+
+    @classmethod
     def execute(
         cls,
         mllm: BerniniMLLM,
@@ -272,10 +308,10 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         source_video=None,
         reference_images=None,
         vit_min_pixels=3136,
-        vit_max_pixels=50176,
+        vit_max_pixels=25088,
     ) -> io.NodeOutput:
-        device = comfy.model_management.get_torch_device()
         load_device = comfy.model_management.text_encoder_device()
+        LOG.info("BerniniPreparePlannerInputs: loading MLLM to %s", load_device)
         mllm.to(load_device)
 
         ref_image_list = []
@@ -291,6 +327,10 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         source_video_ve, source_video_vg = None, None
         if source_video is not None:
             num_videos = 1
+            LOG.info(
+                "BerniniPreparePlannerInputs: encoding source video (%d frames, vit_max_pixels=%d)",
+                source_video.shape[0], vit_max_pixels,
+            )
             source_video_ve, source_video_vg = mllm.encode_videos(
                 [source_video],
                 vit_min_pixels=vit_min_pixels,
@@ -302,6 +342,7 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
 
         image_embeds, image_grid_thw = [], []
         if ref_image_list:
+            LOG.info("BerniniPreparePlannerInputs: encoding %d reference image(s)", len(ref_image_list))
             ie, ig = mllm.encode_images(
                 ref_image_list,
                 vit_min_pixels=vit_min_pixels,
@@ -318,6 +359,7 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                 placeholder = ref_image_list[0] if ref_image_list else source_video[0:1]
             else:
                 placeholder = torch.zeros((1, height, width, 3))
+            LOG.info("BerniniPreparePlannerInputs: encoding output image placeholder")
             ie, ig = mllm.encode_images(
                 [placeholder],
                 vit_min_pixels=vit_min_pixels,
@@ -327,8 +369,14 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
             image_grid_thw.extend(ig)
         else:
             if source_video is not None:
+                # Reuse input encode — same grid_thw, saves a full visual forward pass.
                 ve, vg = source_video_ve, source_video_vg
+                LOG.info("BerniniPreparePlannerInputs: output video placeholder reused from source (skipped re-encode)")
             else:
+                LOG.info(
+                    "BerniniPreparePlannerInputs: encoding fake output video placeholder (%d frames, vit_max_pixels=%d)",
+                    length, vit_max_pixels,
+                )
                 fake_vid = torch.zeros((length, height, width, 3))
                 ve, vg = mllm.encode_videos(
                     [fake_vid],
@@ -338,6 +386,8 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                 )
             video_embeds.extend(ve)
             video_grid_thw.extend(vg)
+
+        LOG.info("BerniniPreparePlannerInputs: building conversation + tokenizing 3 branches...")
         inputs_json = generate_unified_inputs_from_counts(
             prompt,
             num_input_videos=num_videos,
@@ -366,7 +416,8 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
             neg_prompt=neg_prompt or "",
         )
         packed = _move_tensors_to_cpu(packed)
-        mllm.offload()
+        # Intentionally NOT offloading here — SemanticPlanning uses the same MLLM immediately.
+        LOG.info("BerniniPreparePlannerInputs: done. MLLM kept on GPU for SemanticPlanning.")
         return io.NodeOutput(BerniniPlannerInputs(packed))
 
 
