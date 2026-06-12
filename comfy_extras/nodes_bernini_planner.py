@@ -109,6 +109,8 @@ class BerniniMLLMLoader(io.ComfyNode):
             category="loaders/bernini",
             description="Load Qwen2.5-VL-7B from models/bernini/bernini_mllm.safetensors "
                         "(convert script output) or a full HF mllm/ directory path. "
+                        "Loads to GPU when VRAM allows (same rules as text encoders); "
+                        "offloads to CPU after planning nodes. "
                         "Tokenizer/processor: models/bernini/mllm_processor/ (no weights).",
             inputs=[
                 io.Combo.Input(

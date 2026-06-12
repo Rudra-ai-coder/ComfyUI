@@ -19,6 +19,23 @@ BERNINI_DIFFUSERS_REPO = "ByteDance/Bernini-Diffusers"
 BERNINI_MLLM_SUBFOLDER = "mllm"
 MLLM_HUB_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_PROCESSOR_SUBDIR = "mllm_processor"
+# Qwen2.5-VL-7B bf16 ≈ 14GB — used for text_encoder_initial_device heuristics.
+MLLM_WEIGHT_BYTES = 14 * 1024 ** 3
+
+
+def _mllm_load_device():
+    """Where to place MLLM weights for planning (GPU when VRAM allows, like CLIP/T5)."""
+    load_device = comfy.model_management.text_encoder_device()
+    offload_device = comfy.model_management.text_encoder_offload_device()
+    return comfy.model_management.text_encoder_initial_device(
+        load_device, offload_device, model_size=MLLM_WEIGHT_BYTES
+    )
+
+
+def _safetensors_device(target: torch.device) -> str:
+    if target.type == "cuda":
+        return str(target)
+    return "cpu"
 
 
 def _tensor_to_pil(image_tensor: torch.Tensor) -> PIL.Image.Image:
@@ -170,7 +187,7 @@ class BerniniMLLM:
         from transformers import Qwen2_5_VLForConditionalGeneration
 
         if device is None:
-            device = comfy.model_management.unet_offload_device()
+            device = _mllm_load_device()
 
         if os.path.isdir(path):
             return cls._load_hf_folder(path, device)
@@ -186,18 +203,23 @@ class BerniniMLLM:
         processor, config, config_path = _load_processor_and_config(processor_path or DEFAULT_PROCESSOR_SUBDIR)
 
         size_gb = os.path.getsize(weights_path) / (1024 ** 3)
+        sd_device = _safetensors_device(device)
         LOG.info(
-            "Loading Bernini MLLM weights %s (%.1f GB on disk) -> %s — "
-            "reading safetensors + load_state_dict can take several minutes on CPU",
+            "Loading Bernini MLLM weights %s (%.1f GB on disk) -> %s (safetensors read on %s)",
             weights_path,
             size_gb,
             device,
+            sd_device,
         )
         model = _create_qwen_mllm_from_config(config, dtype=torch.bfloat16)
+        if device.type != "cpu":
+            model = model.to(device=device)
 
         from safetensors.torch import load_file
 
-        state_dict = _remap_bernini_mllm_state_dict(load_file(weights_path, device="cpu"))
+        state_dict = _remap_bernini_mllm_state_dict(
+            load_file(weights_path, device=sd_device)
+        )
         LOG.info("MLLM safetensors read complete (%d tensors), applying to model...", len(state_dict))
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         LOG.info("MLLM state dict applied (missing=%d, unexpected=%d)", len(missing), len(unexpected))
@@ -209,7 +231,8 @@ class BerniniMLLM:
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
-        model.to(device)
+        if device.type == "cpu":
+            model.to(device)
         return cls(model, processor, weights_path, config_path, config)
 
     @classmethod
@@ -305,6 +328,5 @@ class BerniniMLLM:
         return make_position_id_func_from_config(self._mllm_config)
 
     def offload(self):
-        offload = comfy.model_management.unet_offload_device()
-        self.to(offload)
+        self.to(comfy.model_management.text_encoder_offload_device())
         comfy.model_management.soft_empty_cache()
