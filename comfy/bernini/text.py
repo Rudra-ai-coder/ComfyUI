@@ -70,9 +70,9 @@ def set_merged_conditioning(conditioning, cross_attn_tensor, extra_pooled=None):
                 p.update(extra_pooled)
             out.append(p)
         return out
-    for i, (_t, pooled) in enumerate(conditioning):
+    for _t, pooled in conditioning:
         p = pooled.copy()
-        if extra_pooled and i == 0:
+        if extra_pooled:
             p.update(extra_pooled)
         out.append([cross_attn_tensor, p])
     return out

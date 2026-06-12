@@ -8,6 +8,7 @@ from comfy.bernini.context import (
     build_branch_cond_list,
     get_branch_cross_attn,
     get_context_latents,
+    get_processed_context_latents,
     get_pooled_value,
     split_context_branches,
 )
@@ -109,7 +110,7 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
 
     def _build_wvitcfg_conds(self, positive):
         pos = self.conds.get("positive")
-        raw_ctx = get_context_latents(positive)
+        raw_ctx = get_processed_context_latents(positive)
         ctx_all = list(raw_ctx) if raw_ctx else None
         txt_wtxt_wvit = get_branch_cross_attn(pos, "wtxt_wvit")
         txt_wtxt_wovit = get_branch_cross_attn(pos, "wtxt_wovit")
@@ -124,10 +125,13 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
     def predict_noise(self, x, timestep, model_options={}, seed=None):
         positive_cond = self.conds.get("positive", None)
         negative_cond = self.conds.get("negative", None)
-        raw_ctx = get_context_latents(positive_cond)
-        ctx_none, ctx_video, ctx_all = split_context_branches(raw_ctx, self._num_videos)
+        # Use model_conds-processed latents (already normalised by process_latent_in).
+        # Branch cond lists bypass extra_conds so they must carry pre-scaled tensors.
+        proc_ctx = get_processed_context_latents(positive_cond)
+        ctx_none, ctx_video, ctx_all = split_context_branches(proc_ctx, self._num_videos)
         mode = self.guidance_mode
-        _, img_omega, txt_omega, tgt_omega = self._scaled_omegas(timestep)
+        # Call once so all four omegas are consistently scaled for this step.
+        vid_omega, img_omega, txt_omega, tgt_omega = self._scaled_omegas(timestep)
 
         if mode == "vae_txt_vit_wapg":
             branches = self._build_wvitcfg_conds(positive_cond)
@@ -188,7 +192,6 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
             eps_none = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)
             eps_v = _calc_one(self.inner_model, branches["v_neg"], x, timestep, model_options)
             eps_vti = _calc_one(self.inner_model, branches["vi_pos"], x, timestep, model_options)
-            vid_omega, _, _, _ = self._scaled_omegas(timestep)
             return chained_cfg_v2v_chain(eps_none, eps_v, eps_vti, vid_omega, txt_omega)
 
         if mode == "rv2v":
@@ -196,7 +199,6 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
             eps_v = _calc_one(self.inner_model, branches["v_neg"], x, timestep, model_options)
             eps_vi = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
             eps_vti = _calc_one(self.inner_model, branches["vi_pos"], x, timestep, model_options)
-            vid_omega, img_omega, _, _ = self._scaled_omegas(timestep)
             return chained_cfg_rv2v(
                 eps_none, eps_v, eps_vi, eps_vti,
                 vid_omega, img_omega, txt_omega,
@@ -209,7 +211,6 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
             eps_vti = _calc_one(self.inner_model, branches["vi_pos"], x, timestep, model_options)
             if len(self._momentum_buffers) < 2:
                 self._momentum_buffers = [MomentumBuffer(self.momentum), MomentumBuffer(self.momentum)]
-            vid_omega, img_omega, _, _ = self._scaled_omegas(timestep)
             return normalized_guidance_chain(
                 eps_none,
                 [eps_v, eps_vi, eps_vti],
@@ -236,13 +237,16 @@ class BerniniGuider(io.ComfyNode):
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Combo.Input("guidance_mode", options=GUIDANCE_MODES, default="rv2v"),
-                io.Float.Input("omega_vid", default=1.25, min=0.0, max=20.0, step=0.05),
-                io.Float.Input("omega_img", default=1.25, min=0.0, max=20.0, step=0.05),
-                io.Float.Input("omega_txt", default=4.0, min=0.0, max=20.0, step=0.05),
-                io.Float.Input("omega_tgt", default=1.0, min=0.0, max=20.0, step=0.05,
-                               tooltip="VIT / planner branch scale (vae_txt_vit_wapg)."),
-                io.Float.Input("omega_scale", default=1.0, min=0.0, max=5.0, step=0.05, advanced=True,
-                               tooltip="Multiply omegas after dual-expert switch (low-noise expert)."),
+                io.Float.Input("omega_vid", default=3.0, min=0.0, max=20.0, step=0.05,
+                               tooltip="Video context guidance scale (official default 3.0)."),
+                io.Float.Input("omega_img", default=3.0, min=0.0, max=20.0, step=0.05,
+                               tooltip="Image/reference context guidance scale (official default 3.0)."),
+                io.Float.Input("omega_txt", default=4.0, min=0.0, max=20.0, step=0.05,
+                               tooltip="Text guidance scale (official default 4.0)."),
+                io.Float.Input("omega_tgt", default=4.0, min=0.0, max=20.0, step=0.05,
+                               tooltip="VIT / planner branch scale (vae_txt_vit_wapg, official default 4.0)."),
+                io.Float.Input("omega_scale", default=0.75, min=0.0, max=5.0, step=0.05, advanced=True,
+                               tooltip="Scale omegas after dual-expert switch (low-noise expert). Official default 0.75."),
                 io.Float.Input("switch_dit_boundary", default=0.875, min=0.0, max=1.0, step=0.01, advanced=True),
                 io.Int.Input("num_train_timesteps", default=1000, min=1, max=10000, advanced=True),
                 io.Float.Input("eta", default=0.5, min=0.0, max=10.0, step=0.01, advanced=True,
@@ -265,8 +269,8 @@ class BerniniGuider(io.ComfyNode):
         omega_vid,
         omega_img,
         omega_txt,
-        omega_tgt=1.0,
-        omega_scale=1.0,
+        omega_tgt=4.0,
+        omega_scale=0.75,
         switch_dit_boundary=0.875,
         num_train_timesteps=1000,
         eta=0.5,

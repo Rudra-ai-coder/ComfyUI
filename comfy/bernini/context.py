@@ -41,6 +41,30 @@ def get_context_latents(conditioning) -> Optional[list]:
     return None
 
 
+def get_processed_context_latents(conditioning) -> Optional[list]:
+    """Return context latents already normalised by process_latent_in (from model_conds).
+
+    After process_conds() runs, model_conds['context_latents'] holds CONDList objects
+    whose .cond list contains process_latent_in-scaled tensors.  The branch cond lists
+    built in predict_noise bypass extra_conds/encode_model_conds, so they must use these
+    pre-scaled latents directly — not the raw vae.encode() outputs stored at entry level.
+    """
+    if not conditioning:
+        return None
+    entry = conditioning[0] if isinstance(conditioning[0], dict) else None
+    if entry is None:
+        return None
+    mc = entry.get("model_conds", {})
+    wrapped = mc.get("context_latents")
+    if wrapped is not None and hasattr(wrapped, "cond"):
+        return list(wrapped.cond)
+    # Fallback: model_conds not yet populated (e.g. called before process_conds)
+    ctx = get_pooled_value(conditioning, "context_latents", None)
+    if ctx is not None:
+        return list(ctx)
+    return None
+
+
 def make_source_ids(num_sources: int, max_trained_src_id: int = 5, interpolate: bool = True) -> List[float]:
     if num_sources <= 0:
         return []
