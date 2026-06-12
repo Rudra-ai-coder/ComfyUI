@@ -37,7 +37,9 @@ GUIDANCE_MODES = [
 def _calc_one(model, cond, x, timestep, model_options):
     if cond is None:
         return None
-    return comfy.samplers.calc_cond_batch(model, cond, x, timestep, model_options)[0]
+    # calc_cond_batch expects list[list[dict]] (outer = branches, inner = cond entries).
+    # Wrap the single branch in an outer list so conds[0] is the list[dict], not a dict.
+    return comfy.samplers.calc_cond_batch(model, [cond], x, timestep, model_options)[0]
 
 
 class Guider_Bernini(comfy.samplers.CFGGuider):
