@@ -4,8 +4,6 @@
 import json
 import os
 import random
-from functools import partial
-from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional
 
 import torch
@@ -23,6 +21,26 @@ def get_drop_condition(text_dropout_rate, img_dropout_rate, video_dropout_rate):
     if random.random() < video_dropout_rate:
         drop_video = 1
     return drop_text, drop_video, drop_img
+
+
+class _QwenRopeIndexHelper:
+    """Delegate HF Qwen2_5_VLModel.get_rope_index (needs get_vision_position_ids on self)."""
+
+    def __init__(self, config):
+        self.config = config
+        self.image_token_id = config.image_token_id
+        self.video_token_id = config.video_token_id
+
+    get_vision_position_ids = Qwen2_5_VLModel.get_vision_position_ids
+    get_rope_index = Qwen2_5_VLModel.get_rope_index
+
+
+def _build_mm_token_type_ids(input_ids: torch.Tensor, image_token_id: int, video_token_id: int) -> torch.Tensor:
+    """Match HF processor: text=0, image=1, video=2 (after BerniniTemplate rewrites visual pads)."""
+    mm = torch.zeros_like(input_ids, dtype=torch.int32)
+    mm[input_ids == image_token_id] = 1
+    mm[input_ids == video_token_id] = 2
+    return mm
 
 
 def bernini_process_sample(
@@ -115,12 +133,34 @@ def bernini_process_sample(
 
 def make_position_id_func_from_config(config):
     """Build Qwen2.5-VL rope index function from a loaded config."""
-    fake_model = SimpleNamespace(
-        config=config,
-        image_token_id=config.image_token_id,
-        video_token_id=config.video_token_id,
-    )
-    return partial(Qwen2_5_VLModel.get_rope_index, fake_model)
+    helper = _QwenRopeIndexHelper(config)
+
+    def position_id_func(
+        input_ids,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        attention_mask=None,
+        second_per_grid_ts=None,
+        **kwargs,
+    ):
+        rope_kwargs = {
+            "input_ids": input_ids,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            "attention_mask": attention_mask,
+            "second_per_grid_ts": second_per_grid_ts,
+        }
+        mm_token_type_ids = _build_mm_token_type_ids(
+            input_ids, config.image_token_id, config.video_token_id
+        )
+        rope_kwargs["mm_token_type_ids"] = mm_token_type_ids
+        try:
+            return helper.get_rope_index(**rope_kwargs)
+        except TypeError:
+            rope_kwargs.pop("mm_token_type_ids", None)
+            return helper.get_rope_index(**rope_kwargs)
+
+    return position_id_func
 
 
 def make_position_id_func(mllm_path: str):

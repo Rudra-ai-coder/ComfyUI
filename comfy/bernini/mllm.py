@@ -146,14 +146,27 @@ def _create_qwen_mllm_from_config(config, dtype=torch.bfloat16):
     return model.to(dtype=dtype)
 
 
+def _remap_mllm_state_dict_key(key: str) -> str:
+    """Map bernini_mllm export keys to HF Qwen2_5_VLForConditionalGeneration."""
+    if key.startswith("lm_head."):
+        return key
+    if not key.startswith("model."):
+        key = "model." + key
+    # Bernini shard: model.visual.* + model.layers.* (Qwen2_5_VLModel language stack).
+    # HF ForConditionalGeneration: model.visual.* + model.language_model.layers.*
+    if (
+        key.startswith("model.layers.")
+        or key.startswith("model.embed_tokens.")
+        or key == "model.norm.weight"
+    ):
+        key = "model.language_model." + key[len("model."):]
+    return key
+
+
 def _remap_bernini_mllm_state_dict(state_dict: dict) -> dict:
-    """bernini_mllm.safetensors strips mllm. → visual.* / layers.*; HF expects model.visual.* etc."""
     out = {}
     for key, tensor in state_dict.items():
-        if key.startswith("model.") or key.startswith("lm_head."):
-            out[key] = tensor
-        else:
-            out["model." + key] = tensor
+        out[_remap_mllm_state_dict_key(key)] = tensor
     return out
 
 

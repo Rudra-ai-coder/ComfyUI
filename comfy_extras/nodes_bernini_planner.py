@@ -288,16 +288,17 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
 
         num_videos = 0
         video_embeds, video_grid_thw = [], []
+        source_video_ve, source_video_vg = None, None
         if source_video is not None:
             num_videos = 1
-            ve, vg = mllm.encode_videos(
+            source_video_ve, source_video_vg = mllm.encode_videos(
                 [source_video],
                 vit_min_pixels=vit_min_pixels,
                 vit_max_pixels=vit_max_pixels,
                 max_frames=length,
             )
-            video_embeds.extend(ve)
-            video_grid_thw.extend(vg)
+            video_embeds.extend(source_video_ve)
+            video_grid_thw.extend(source_video_vg)
 
         image_embeds, image_grid_thw = [], []
         if ref_image_list:
@@ -326,12 +327,7 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
             image_grid_thw.extend(ig)
         else:
             if source_video is not None:
-                ve, vg = mllm.encode_videos(
-                    [source_video],
-                    vit_min_pixels=vit_min_pixels,
-                    vit_max_pixels=vit_max_pixels,
-                    max_frames=length,
-                )
+                ve, vg = source_video_ve, source_video_vg
             else:
                 fake_vid = torch.zeros((length, height, width, 3))
                 ve, vg = mllm.encode_videos(
