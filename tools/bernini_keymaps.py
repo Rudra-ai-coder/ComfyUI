@@ -111,5 +111,9 @@ def classify_bernini_key(key: str) -> str:
 
 def export_key_for_bucket(key: str, bucket: str) -> str:
     if bucket == BUCKET_MLLM and key.startswith("mllm."):
-        return key[len("mllm."):]
+        inner = key[len("mllm."):]
+        # Qwen2_5_VLForConditionalGeneration expects model.visual.* / model.layers.*
+        if not inner.startswith("model.") and not inner.startswith("lm_head."):
+            inner = "model." + inner
+        return inner
     return key

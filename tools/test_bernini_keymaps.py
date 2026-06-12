@@ -49,8 +49,8 @@ def test_strip_and_remap():
 
 
 def test_mllm_export():
-    key = "mllm.model.norm.weight"
-    assert export_key_for_bucket(key, BUCKET_MLLM) == "model.norm.weight"
+    assert export_key_for_bucket("mllm.model.norm.weight", BUCKET_MLLM) == "model.norm.weight"
+    assert export_key_for_bucket("mllm.visual.patch_embed.proj.weight", BUCKET_MLLM) == "model.visual.patch_embed.proj.weight"
 
 
 def main():

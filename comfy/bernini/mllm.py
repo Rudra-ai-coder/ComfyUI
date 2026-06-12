@@ -120,6 +120,27 @@ def _create_qwen_mllm_from_config(config, dtype=torch.bfloat16):
     return model.to(dtype=dtype)
 
 
+def _remap_bernini_mllm_state_dict(state_dict: dict) -> dict:
+    """bernini_mllm.safetensors strips mllm. → visual.* / layers.*; HF expects model.visual.* etc."""
+    out = {}
+    for key, tensor in state_dict.items():
+        if key.startswith("model.") or key.startswith("lm_head."):
+            out[key] = tensor
+        else:
+            out["model." + key] = tensor
+    return out
+
+
+def _extract_visual_embeds(output) -> torch.Tensor:
+    if torch.is_tensor(output):
+        return output
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output
+    raise TypeError(f"Unexpected Qwen2.5-VL visual forward output type: {type(output)}")
+
+
 def _get_visual_module(model):
     if hasattr(model, "visual") and getattr(model, "visual", None) is not None:
         return model.visual
@@ -164,13 +185,22 @@ class BerniniMLLM:
         weights_path = resolve_bernini_model_path(path)
         processor, config, config_path = _load_processor_and_config(processor_path or DEFAULT_PROCESSOR_SUBDIR)
 
-        LOG.info("Loading Bernini MLLM weights %s -> %s", weights_path, device)
+        size_gb = os.path.getsize(weights_path) / (1024 ** 3)
+        LOG.info(
+            "Loading Bernini MLLM weights %s (%.1f GB on disk) -> %s — "
+            "reading safetensors + load_state_dict can take several minutes on CPU",
+            weights_path,
+            size_gb,
+            device,
+        )
         model = _create_qwen_mllm_from_config(config, dtype=torch.bfloat16)
 
         from safetensors.torch import load_file
 
-        state_dict = load_file(weights_path, device="cpu")
+        state_dict = _remap_bernini_mllm_state_dict(load_file(weights_path, device="cpu"))
+        LOG.info("MLLM safetensors read complete (%d tensors), applying to model...", len(state_dict))
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        LOG.info("MLLM state dict applied (missing=%d, unexpected=%d)", len(missing), len(unexpected))
         if missing:
             LOG.warning("Bernini MLLM missing keys (%d): %s", len(missing), missing[:8])
         if unexpected:
@@ -212,7 +242,7 @@ class BerniniMLLM:
         pixel_values = pixel_values.type(self.model.dtype).to(self.model.device)
         grid_thw = grid_thw.to(self.model.device)
         with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
-            image_embeds = visual(pixel_values, grid_thw=grid_thw)
+            image_embeds = _extract_visual_embeds(visual(pixel_values, grid_thw=grid_thw))
         split_sizes = (grid_thw.prod(-1) // visual.spatial_merge_size ** 2).tolist()
         return torch.split(image_embeds, split_sizes)
 
