@@ -682,10 +682,12 @@ class WanModel(torch.nn.Module):
 
         # In-context reference: one rope block per stream, each with it's own source_id (1, 2, ...) to distinguish from the target (id 0).
         context_latents = kwargs.get("context_latents", None)
+        bernini_source_ids = kwargs.get("bernini_source_ids", None)
         if context_latents is not None:
             context_latents = [comfy.ldm.common_dit.pad_to_patch_size(lat, self.patch_size) for lat in context_latents]
             for i, lat in enumerate(context_latents):
-                freqs = torch.cat([freqs, self.rope_encode(lat.shape[-3], lat.shape[-2], lat.shape[-1], device=x.device, dtype=x.dtype, transformer_options=transformer_options, source_id=i + 1)], dim=1)
+                sid = bernini_source_ids[i] if bernini_source_ids is not None and i < len(bernini_source_ids) else (i + 1)
+                freqs = torch.cat([freqs, self.rope_encode(lat.shape[-3], lat.shape[-2], lat.shape[-1], device=x.device, dtype=x.dtype, transformer_options=transformer_options, source_id=sid)], dim=1)
             kwargs = {**kwargs, "context_latents": context_latents}
 
         return self.forward_orig(x, timestep, context, clip_fea=clip_fea, freqs=freqs, transformer_options=transformer_options, **kwargs)[:, :, :t, :h, :w]
