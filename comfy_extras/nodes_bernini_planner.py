@@ -686,11 +686,24 @@ class BerniniSavePlannerInputs(io.ComfyNode):
         )
 
     @classmethod
+    def IS_CHANGED(cls, planner_inputs, filename: str):
+        # Always execute so the file is written even when upstream is cached.
+        return float("nan")
+
+    @classmethod
     def execute(cls, planner_inputs: BerniniPlannerInputs, filename: str) -> io.NodeOutput:
         path = _resolve_bpi_path(filename)
+        LOG.info("BerniniSavePlannerInputs: saving to %s ...", path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tensors, metadata = _flatten_bpi(planner_inputs.data)
+        if not tensors:
+            raise ValueError(
+                "BerniniSavePlannerInputs: nothing to save — planner_inputs.data has no tensors. "
+                "Make sure BerniniPreparePlannerInputs ran successfully before this node."
+            )
         save_file(tensors, path, metadata=metadata)
-        LOG.info("Bernini planner inputs saved → %s  (%d tensors)", path, len(tensors))
+        size_mb = os.path.getsize(path) / (1024 ** 2)
+        LOG.info("BerniniSavePlannerInputs: saved %d tensors to %s (%.1f MB)", len(tensors), path, size_mb)
         return io.NodeOutput(planner_inputs)
 
 
