@@ -370,13 +370,12 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
 
         output_t = 1 if length == 1 else length
 
-        # Target output VIT placeholder (official pipeline duplicates source or uses fake).
+        # Target output VIT placeholder.
+        # Original always uses create_fake_image (black zeros) for the image-output slot
+        # so the planner has a clean neutral base to fill in — not reference pixels.
         if output_t == 1:
-            if ref_image_list or source_video is not None:
-                placeholder = ref_image_list[0] if ref_image_list else source_video[0:1]
-            else:
-                placeholder = torch.zeros((1, height, width, 3))
-            LOG.info("BerniniPreparePlannerInputs: encoding output image placeholder")
+            placeholder = torch.zeros((1, height, width, 3))
+            LOG.info("BerniniPreparePlannerInputs: encoding black output image placeholder (%dx%d)", height, width)
             ie, ig = mllm.encode_images(
                 [placeholder],
                 vit_min_pixels=vit_min_pixels,

@@ -65,7 +65,10 @@ def _sample_video_frames(
 
     Mirrors the official pipeline's smart_video_nframes logic:
       target = total_frames * vit_fps / video_fps
-    then snapped to a multiple of frame_factor and clamped to [frame_factor, max_frames].
+    snapped to a multiple of frame_factor and clamped to [frame_factor, max_frames].
+    When fps values are equal (no sub-sampling), total is snapped down to frame_factor.
+    Indices use round() (matching torch.linspace().round()) rather than truncation.
+    Short videos are padded by repeating the last frame to reach the target count.
     """
     total = video.shape[0]
     if video_fps > 0 and vit_fps > 0 and video_fps != vit_fps:
@@ -73,14 +76,20 @@ def _sample_video_frames(
         target = int(math.floor(raw / frame_factor)) * frame_factor
         target = max(frame_factor, min(target, max_frames, total))
     else:
-        # No fps sub-sampling: keep all frames up to max, snapped to frame_factor
-        target = (min(total, max_frames) // frame_factor) * frame_factor
-        target = max(frame_factor, target)
+        # No fps sub-sampling: snap total down to frame_factor multiple then clamp.
+        snapped_total = (total // frame_factor) * frame_factor
+        target = max(frame_factor, min(snapped_total, max_frames))
 
     if target >= total:
         indices = list(range(total))
     else:
-        indices = np.linspace(0, total - 1, target).astype(int).tolist()
+        # Use round() to match torch.linspace().round().long() in original.
+        indices = np.linspace(0, total - 1, target).round().astype(int).tolist()
+
+    # Pad to target by repeating the last frame (matches original short-video handling).
+    if len(indices) < target:
+        indices = indices + [indices[-1]] * (target - len(indices))
+
     return [_tensor_to_pil(video[i]) for i in indices]
 
 
@@ -191,12 +200,21 @@ def _remap_bernini_mllm_state_dict(state_dict: dict) -> dict:
 
 
 def _extract_visual_embeds(output) -> torch.Tensor:
-    """HF transformers visual returns BaseModelOutputWithPooling: pooler_output is post-merger (official Bernini path)."""
+    """Extract post-merger VIT features from the Qwen2.5-VL visual module output.
+
+    The official Bernini visual module returns a raw tensor (post-merger).
+    HF Qwen2.5-VL returns BaseModelOutputWithPooling where pooler_output holds
+    the same post-merger features.  last_hidden_state is pre-merger (wrong for Bernini).
+    """
     if torch.is_tensor(output):
         return output
     if hasattr(output, "pooler_output") and output.pooler_output is not None:
         return output.pooler_output
     if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        LOG.warning(
+            "Bernini VIT: pooler_output not available — falling back to last_hidden_state "
+            "(pre-merger features). This is likely incorrect and may degrade quality."
+        )
         return output.last_hidden_state
     raise TypeError(f"Unexpected Qwen2.5-VL visual forward output type: {type(output)}")
 
