@@ -1150,7 +1150,7 @@
               "Node name for S&R": "KSamplerSelect"
             },
             "widgets_values": [
-              "uni_pc"
+              "euler"
             ]
           },
           {
@@ -1316,10 +1316,10 @@
             },
             "widgets_values": [
               "vae_txt_vit_wapg",
-              1.25,
-              1.25,
+              3.0,
+              3.0,
               4.0,
-              0.5,
+              4.0,
               1.0
             ]
           },
@@ -1409,10 +1409,10 @@
             },
             "widgets_values": [
               "vae_txt_vit_wapg",
-              1.25,
-              1.25,
+              3.0,
+              3.0,
               4.0,
-              0.5,
+              4.0,
               0.75
             ]
           },
@@ -1920,7 +1920,7 @@
               "Node name for S&R": "BerniniPreparePlannerInputs"
             },
             "widgets_values": [
-              "v2v",
+              "rv2v",
               3136,
               50176,
               "vivid tones, overexposed, static, blurry details, subtitles, style, artwork, painting, image, motionless, overall grayish, worst quality, low quality, JPEG compression artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fused fingers, still frame, cluttered background, three legs, too many people in the background, walking backwards"
@@ -2009,9 +2009,9 @@
             },
             "widgets_values": [
               25,
+              1.4,
               1.2,
-              1.0,
-              5
+              3
             ]
           },
           {
@@ -2571,7 +2571,7 @@
           "workflowRendererVersion": "LG"
         },
         "category": "Video generation and editing/Video to video",
-        "description": "Full Bernini video-to-video: Qwen2.5-VL semantic planning (~25 MaskGIT steps) + UMT5/planner text merge + vae_txt_vit_wapg chained guidance. Dual DiT experts at boundary 0.875. Omegas match scripts/bernini/run_v2v.sh."
+        "description": "Full Bernini rv2v: Qwen2.5-VL semantic planning (~25 MaskGIT steps) + UMT5/planner text merge + vae_txt_vit_wapg chained guidance. Dual DiT experts at boundary 0.875. Omegas: vid=3.0, img=3.0, txt=4.0, tgt=4.0, omega_scale=0.75 (low-noise expert)."
       }
     ]
   },

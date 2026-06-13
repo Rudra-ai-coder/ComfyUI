@@ -846,7 +846,7 @@
               "ver": "0.3.45",
               "Node name for S&R": "KSamplerSelect"
             },
-            "widgets_values": ["uni_pc"]
+            "widgets_values": ["euler"]
           },
           {
             "id": 14,
@@ -972,7 +972,7 @@
             "properties": {
               "Node name for S&R": "BerniniGuider"
             },
-            "widgets_values": ["rv2v", 1.25, 4.5, 4.0]
+            "widgets_values": ["rv2v", 3.0, 3.0, 4.0]
           },
           {
             "id": 17,
@@ -1042,7 +1042,7 @@
             "properties": {
               "Node name for S&R": "BerniniGuider"
             },
-            "widgets_values": ["rv2v", 1.25, 4.5, 4.0, 1.0, 0.8]
+            "widgets_values": ["rv2v", 3.0, 3.0, 4.0, 1.0, 0.75]
           },
           {
             "id": 18,
@@ -1324,7 +1324,7 @@
           "workflowRendererVersion": "LG"
         },
         "category": "Video generation and editing/Video to video",
-        "description": "Bernini-R reference-guided video editing (rv2v): source video + reference image(s), chained rv2v guidance, dual DiT experts at boundary 0.875. Omegas match Bernini-R Gradio BASE defaults; omega_scale on low-noise guider only."
+        "description": "Bernini-R reference-guided video editing (rv2v): source video + reference image(s), chained rv2v guidance, dual DiT experts at boundary 0.875. Omegas: vid=3.0, img=3.0, txt=4.0 (official defaults); omega_scale=0.75 on low-noise guider only."
       }
     ]
   },

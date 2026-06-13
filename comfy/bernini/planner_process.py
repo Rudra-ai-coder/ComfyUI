@@ -115,9 +115,12 @@ def bernini_process_sample(
         video_grid_thw = None
 
     if visual_embeds:
-        tokenized_example["visual_embeds"] = torch.cat(visual_embeds, dim=0)
+        tgt_device = visual_embeds[0].device
+        tokenized_example["visual_embeds"] = torch.cat(
+            [e.to(tgt_device) for e in visual_embeds], dim=0
+        )
     else:
-        tokenized_example["visual_embeds"] = torch.randn(0, 3584)
+        tokenized_example["visual_embeds"] = torch.zeros(0, 3584)
 
     input_ids = tokenized_example["input_ids"]
     tokenized_example["position_ids"] = position_id_func(

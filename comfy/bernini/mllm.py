@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bernini Qwen2.5-VL-7B MLLM wrapper (HF folder or bernini_mllm.safetensors)."""
 
+import contextlib
 import logging
 import math
 import os
@@ -325,27 +326,37 @@ class BerniniMLLM:
         size_gb = os.path.getsize(weights_path) / (1024 ** 3)
         sd_device = _safetensors_device(device)
         LOG.info(
-            "Loading Bernini MLLM weights %s (%.1f GB on disk) -> %s (safetensors read on %s)",
-            weights_path,
-            size_gb,
-            device,
-            sd_device,
+            "Loading Bernini MLLM weights %s (%.1f GB on disk) -> %s",
+            weights_path, size_gb, device,
         )
 
         if device.type == "cuda":
             comfy.model_management.soft_empty_cache()
 
-        model = _create_qwen_mllm_from_config(self._mllm_config, dtype=torch.bfloat16)
-        if device.type != "cpu":
-            model = model.to(device=device)
+        # Fast path: create model on meta device (0 bytes allocated) so no
+        # useless random-weight init and no PCIe transfer before the real load.
+        try:
+            from accelerate import init_empty_weights
+            init_ctx = init_empty_weights()
+        except ImportError:
+            init_ctx = contextlib.nullcontext()
+            LOG.debug("accelerate not found — MLLM shell will be randomly initialised on CPU")
 
+        with init_ctx:
+            model = _create_qwen_mllm_from_config(self._mllm_config, dtype=torch.bfloat16)
+
+        # Load weights once, directly to target device (no CPU staging).
         from safetensors.torch import load_file
-
         state_dict = _remap_bernini_mllm_state_dict(
             load_file(weights_path, device=sd_device)
         )
         LOG.info("MLLM safetensors read complete (%d tensors), applying to model...", len(state_dict))
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+        # assign=True: loaded tensors become the model's parameters in-place —
+        # no GPU→GPU copy.  Works for both meta-device and CPU-initialised shells.
+        missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+        del state_dict
+
         LOG.info("MLLM state dict applied (missing=%d, unexpected=%d)", len(missing), len(unexpected))
         if missing:
             LOG.warning("Bernini MLLM missing keys (%d): %s", len(missing), missing[:8])
@@ -355,8 +366,6 @@ class BerniniMLLM:
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
-        if device.type == "cpu":
-            model.to(device)
 
         self.model = model
         self._weights_loaded = True
@@ -365,15 +374,26 @@ class BerniniMLLM:
         from transformers import Qwen2_5_VLForConditionalGeneration
 
         LOG.info("Loading Bernini MLLM from HF folder %s -> %s", path, device)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            path,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        )
+        # Use device_map so HF/accelerate streams weights straight to the target device.
+        try:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                path,
+                torch_dtype=torch.bfloat16,
+                device_map=str(device),
+                trust_remote_code=True,
+            )
+        except (ImportError, ValueError):
+            # accelerate not installed or device_map unsupported — fall back.
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                path,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
+            model.to(device)
+
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
-        model.to(device)
         self.model = model
         self._weights_loaded = True
 
