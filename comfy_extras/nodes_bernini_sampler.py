@@ -17,7 +17,6 @@ from comfy.bernini.guidance import (
     chained_cfg_rv2v,
     chained_cfg_v2v_chain,
     normalized_guidance,
-    normalized_guidance_chain,
     vae_txt_vit_wapg,
 )
 from comfy_api.latest import ComfyExtension, io
@@ -205,19 +204,29 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
             )
 
         if mode == "rv2v_wapg":
+            # Plain chained CFG with 4 omega terms — matching sample_one_step in the original.
+            # Differs from rv2v only in the split of positive into txt-only and txt+VIT branches
+            # so that omega_tgt controls the VIT/planner link independently.
             eps_none = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)
             eps_v = _calc_one(self.inner_model, branches["v_neg"], x, timestep, model_options)
             eps_vi = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
-            eps_vti = _calc_one(self.inner_model, branches["vi_pos"], x, timestep, model_options)
-            if len(self._momentum_buffers) < 2:
-                self._momentum_buffers = [MomentumBuffer(self.momentum), MomentumBuffer(self.momentum)]
-            return normalized_guidance_chain(
-                eps_none,
-                [eps_v, eps_vi, eps_vti],
-                [vid_omega, img_omega, txt_omega],
-                self._momentum_buffers,
-                self.eta,
-                [self.norm_threshold, self.norm_threshold, self.norm_threshold],
+            # eps_vti: video+img context, positive text, NO VIT tokens (wtxt_wovit)
+            # eps_vtic: video+img context, positive text + VIT tokens (wtxt_wvit)
+            pos = self.conds.get("positive")
+            raw_ctx = get_processed_context_latents(positive_cond)
+            ctx_all_list = list(raw_ctx) if raw_ctx else None
+            txt_wtxt_wovit = get_branch_cross_attn(pos, "wtxt_wovit")
+            txt_wtxt_wvit = get_branch_cross_attn(pos, "wtxt_wvit")
+            vi_pos_txt = build_branch_cond_list(pos, ctx_all_list, txt_wtxt_wovit)
+            vi_pos_vit = build_branch_cond_list(pos, ctx_all_list, txt_wtxt_wvit)
+            eps_vti = _calc_one(self.inner_model, vi_pos_txt, x, timestep, model_options)
+            eps_vtic = _calc_one(self.inner_model, vi_pos_vit, x, timestep, model_options)
+            return (
+                eps_none
+                + vid_omega * (eps_v   - eps_none)
+                + img_omega * (eps_vi  - eps_v)
+                + txt_omega * (eps_vti - eps_vi)
+                + tgt_omega * (eps_vtic - eps_vti)
             )
 
         raise ValueError(f"Unknown Bernini guidance_mode: {mode}")
