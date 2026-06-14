@@ -163,14 +163,22 @@ def _load_processor_and_config(processor_name: str):
     return processor, config, BERNINI_DIFFUSERS_REPO
 
 
-def _create_qwen_mllm_from_config(config, dtype=torch.bfloat16):
-    """Match official Bernini: Qwen2_5_VLForConditionalGeneration._from_config."""
+def _create_qwen_mllm_from_config(config, dtype=torch.bfloat16, attn_implementation: str = "sdpa"):
+    """Match official Bernini: Qwen2_5_VLForConditionalGeneration._from_config.
+
+    attn_implementation="sdpa" mirrors bernini/configs/bernini/config.json
+    mllm_attn_implementation, ensuring SDPA is used rather than falling back
+    to the slower eager attention during the planning forward passes.
+    """
     from transformers import Qwen2_5_VLForConditionalGeneration
 
+    kwargs = {"dtype": dtype}
+    if attn_implementation:
+        kwargs["attn_implementation"] = attn_implementation
     if hasattr(Qwen2_5_VLForConditionalGeneration, "_from_config"):
-        return Qwen2_5_VLForConditionalGeneration._from_config(config, dtype=dtype)
+        return Qwen2_5_VLForConditionalGeneration._from_config(config, **kwargs)
     if hasattr(Qwen2_5_VLForConditionalGeneration, "from_config"):
-        return Qwen2_5_VLForConditionalGeneration.from_config(config, dtype=dtype)
+        return Qwen2_5_VLForConditionalGeneration.from_config(config, **kwargs)
     model = Qwen2_5_VLForConditionalGeneration(config)
     return model.to(dtype=dtype)
 
