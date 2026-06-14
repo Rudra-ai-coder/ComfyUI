@@ -49,13 +49,12 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         omega_vid: float,
         omega_img: float,
         omega_txt: float,
-        eta: float = 0.5,
+        eta: float = 1.0,
         norm_threshold: float = 50.0,
         momentum: float = 0.0,
         omega_tgt: float = 1.0,
         omega_scale: float = 1.0,
         switch_dit_boundary: float = 0.875,
-        num_train_timesteps: int = 1000,
         apg_parallel_scale: float = 0.2,
         apg_orthogonal_scale: float = 1.0,
     ):
@@ -69,7 +68,6 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         self.momentum = momentum
         self.omega_scale = omega_scale
         self.switch_dit_boundary = switch_dit_boundary
-        self.num_train_timesteps = num_train_timesteps
         self.apg_parallel_scale = apg_parallel_scale
         self.apg_orthogonal_scale = apg_orthogonal_scale
         self._momentum_buffers: List[MomentumBuffer] = []
@@ -84,17 +82,20 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         return super().sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
 
     def _scaled_omegas(self, timestep):
-        txt, tgt, img, vid = self.omega_txt, self.omega_tgt, self.omega_img, self.omega_vid
+        # ComfyUI sigmas are in [0, 1]; compare directly to switch_dit_boundary (also 0–1).
+        # The original Bernini scales omegas once when switching from the high-noise to the
+        # low-noise expert. In ComfyUI there is only one model, so omega_scale should be 1.0
+        # unless you are emulating the dual-expert schedule manually.
         if self.omega_scale != 1.0 and not self._omega_scaled:
-            boundary = self.switch_dit_boundary * self.num_train_timesteps
             t_val = float(timestep.flatten()[0])
-            if t_val < boundary:
-                txt *= self.omega_scale
-                tgt *= self.omega_scale
-                img *= self.omega_scale
-                vid *= self.omega_scale
+            if t_val < self.switch_dit_boundary:
+                # Permanently modify stored omegas so all subsequent steps see the scaled values.
+                self.omega_txt *= self.omega_scale
+                self.omega_tgt *= self.omega_scale
+                self.omega_img *= self.omega_scale
+                self.omega_vid *= self.omega_scale
                 self._omega_scaled = True
-        return vid, img, txt, tgt
+        return self.omega_vid, self.omega_img, self.omega_txt, self.omega_tgt
 
     def _build_conds(self, positive, negative, ctx_none, ctx_video, ctx_all):
         pos = self.conds.get("positive")
@@ -169,13 +170,10 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         if mode == "t2v_apg":
             eps_u = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)
             eps_t = _calc_one(self.inner_model, branches["t_pos"], x, timestep, model_options)
-            # Same x-space APG as v2v_apg — operates on denoised samples, not velocities.
-            sigma = timestep.reshape([timestep.shape[0]] + [1] * (x.dim() - 1)).to(x.dtype)
-            x_u = x - sigma * eps_u
-            x_t = x - sigma * eps_t
+            # ComfyUI's apply_model (CONST.calculate_denoised) already converts velocity → x0,
+            # so eps_u/eps_t are denoised x0 estimates. Apply APG directly in x0-space.
             mb = MomentumBuffer(self.momentum)
-            x_guided = normalized_guidance(x_t, x_u, txt_omega, mb, self.eta, self.norm_threshold)
-            return (x - x_guided) / sigma
+            return normalized_guidance(eps_t, eps_u, txt_omega, mb, self.eta, self.norm_threshold)
 
         if mode == "v2v":
             eps_u = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
@@ -185,14 +183,10 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         if mode == "v2v_apg":
             eps_u = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
             eps_t = _calc_one(self.inner_model, branches["vi_pos"], x, timestep, model_options)
-            # Original applies APG in x-space (denoised sample), not velocity space.
-            # In ComfyUI flow-matching, timestep IS sigma; x_pred = noisy - sigma * velocity.
-            sigma = timestep.reshape([timestep.shape[0]] + [1] * (x.dim() - 1)).to(x.dtype)
-            x_u = x - sigma * eps_u
-            x_t = x - sigma * eps_t
+            # ComfyUI's apply_model (CONST.calculate_denoised) already converts velocity → x0,
+            # so eps_u/eps_t are denoised x0 estimates. Apply APG directly in x0-space.
             mb = MomentumBuffer(self.momentum)
-            x_guided = normalized_guidance(x_t, x_u, txt_omega, mb, self.eta, self.norm_threshold)
-            return (x - x_guided) / sigma
+            return normalized_guidance(eps_t, eps_u, txt_omega, mb, self.eta, self.norm_threshold)
 
         if mode == "v2v_chain":
             eps_none = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)
@@ -253,22 +247,27 @@ class BerniniGuider(io.ComfyNode):
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Combo.Input("guidance_mode", options=GUIDANCE_MODES, default="rv2v"),
-                io.Float.Input("omega_vid", default=3.0, min=0.0, max=20.0, step=0.05,
-                               tooltip="Video context guidance scale (official default 3.0)."),
-                io.Float.Input("omega_img", default=3.0, min=0.0, max=20.0, step=0.05,
-                               tooltip="Image/reference context guidance scale (official default 3.0)."),
+                io.Float.Input("omega_vid", default=1.25, min=0.0, max=20.0, step=0.05,
+                               tooltip="Video context guidance scale. Official CLI default: 1.25."),
+                io.Float.Input("omega_img", default=4.5, min=0.0, max=20.0, step=0.05,
+                               tooltip="Image/reference context guidance scale. Official CLI default: 4.5."),
                 io.Float.Input("omega_txt", default=4.0, min=0.0, max=20.0, step=0.05,
-                               tooltip="Text guidance scale (official default 4.0)."),
+                               tooltip="Text guidance scale. Official default: 4.0."),
                 io.Float.Input("omega_tgt", default=4.0, min=0.0, max=20.0, step=0.05,
-                               tooltip="VIT / planner branch scale (vae_txt_vit_wapg, official default 4.0)."),
-                io.Float.Input("omega_scale", default=0.75, min=0.0, max=5.0, step=0.05, advanced=True,
-                               tooltip="Scale omegas after dual-expert switch (low-noise expert). Official default 0.75."),
-                io.Float.Input("switch_dit_boundary", default=0.875, min=0.0, max=1.0, step=0.01, advanced=True),
-                io.Int.Input("num_train_timesteps", default=1000, min=1, max=10000, advanced=True),
-                io.Float.Input("eta", default=0.5, min=0.0, max=10.0, step=0.01, advanced=True,
-                               tooltip="APG parallel scale (APG modes only)."),
-                io.Float.Input("norm_threshold", default=50.0, min=0.0, max=500.0, step=0.1, advanced=True),
-                io.Float.Input("momentum", default=0.0, min=-5.0, max=1.0, step=0.01, advanced=True),
+                               tooltip="VIT/planner branch scale (rv2v_wapg, vae_txt_vit_wapg). Official default: 4.0."),
+                io.Float.Input("omega_scale", default=1.0, min=0.0, max=5.0, step=0.05, advanced=True,
+                               tooltip="Multiplies all omegas once after dual-expert boundary (sigma < switch_dit_boundary). "
+                                       "Original dual-expert default: 0.8. Set to 1.0 (default) for single-model ComfyUI runs."),
+                io.Float.Input("switch_dit_boundary", default=0.875, min=0.0, max=1.0, step=0.01, advanced=True,
+                               tooltip="Sigma threshold (0-1) at which the dual-expert switches from high-noise to low-noise model."),
+                io.Float.Input("eta", default=1.0, min=0.0, max=2.0, step=0.01, advanced=True,
+                               tooltip="APG parallel-component retention (APG modes only). "
+                                       "1.0 = same direction as CFG (safe default). "
+                                       "0.5 = remove half of parallel component (official CLI default)."),
+                io.Float.Input("norm_threshold", default=50.0, min=0.0, max=500.0, step=0.1, advanced=True,
+                               tooltip="APG: clip the guidance delta L2 norm per frame to this value (0 = disabled). Official default: 50.0."),
+                io.Float.Input("momentum", default=0.0, min=-1.0, max=1.0, step=0.01, advanced=True,
+                               tooltip="APG momentum decay. 0 = disabled (official CLI default). -0.5 = BerniniPipeline Python default."),
                 io.Float.Input("apg_parallel_scale", default=0.2, min=0.0, max=2.0, step=0.01, advanced=True),
                 io.Float.Input("apg_orthogonal_scale", default=1.0, min=0.0, max=2.0, step=0.01, advanced=True),
             ],
@@ -286,10 +285,9 @@ class BerniniGuider(io.ComfyNode):
         omega_img,
         omega_txt,
         omega_tgt=4.0,
-        omega_scale=0.75,
+        omega_scale=1.0,
         switch_dit_boundary=0.875,
-        num_train_timesteps=1000,
-        eta=0.5,
+        eta=1.0,
         norm_threshold=50.0,
         momentum=0.0,
         apg_parallel_scale=0.2,
@@ -305,7 +303,6 @@ class BerniniGuider(io.ComfyNode):
             omega_tgt=omega_tgt,
             omega_scale=omega_scale,
             switch_dit_boundary=switch_dit_boundary,
-            num_train_timesteps=num_train_timesteps,
             eta=eta,
             norm_threshold=norm_threshold,
             momentum=momentum,
