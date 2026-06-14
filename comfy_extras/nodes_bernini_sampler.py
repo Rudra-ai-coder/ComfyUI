@@ -169,10 +169,13 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         if mode == "t2v_apg":
             eps_u = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)
             eps_t = _calc_one(self.inner_model, branches["t_pos"], x, timestep, model_options)
+            # Same x-space APG as v2v_apg — operates on denoised samples, not velocities.
+            sigma = timestep.reshape([timestep.shape[0]] + [1] * (x.dim() - 1)).to(x.dtype)
+            x_u = x - sigma * eps_u
+            x_t = x - sigma * eps_t
             mb = MomentumBuffer(self.momentum)
-            return normalized_guidance(
-                eps_t, eps_u, txt_omega, mb, self.eta, self.norm_threshold
-            )
+            x_guided = normalized_guidance(x_t, x_u, txt_omega, mb, self.eta, self.norm_threshold)
+            return (x - x_guided) / sigma
 
         if mode == "v2v":
             eps_u = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
@@ -182,10 +185,14 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         if mode == "v2v_apg":
             eps_u = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
             eps_t = _calc_one(self.inner_model, branches["vi_pos"], x, timestep, model_options)
+            # Original applies APG in x-space (denoised sample), not velocity space.
+            # In ComfyUI flow-matching, timestep IS sigma; x_pred = noisy - sigma * velocity.
+            sigma = timestep.reshape([timestep.shape[0]] + [1] * (x.dim() - 1)).to(x.dtype)
+            x_u = x - sigma * eps_u
+            x_t = x - sigma * eps_t
             mb = MomentumBuffer(self.momentum)
-            return normalized_guidance(
-                eps_t, eps_u, txt_omega, mb, self.eta, self.norm_threshold
-            )
+            x_guided = normalized_guidance(x_t, x_u, txt_omega, mb, self.eta, self.norm_threshold)
+            return (x - x_guided) / sigma
 
         if mode == "v2v_chain":
             eps_none = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)
