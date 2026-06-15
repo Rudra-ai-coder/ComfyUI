@@ -1167,23 +1167,35 @@ class PromptServer():
         image_type = image_data[0]
         image = image_data[1]
         max_size = image_data[2]
+        # Optional 4th element: list of extra PIL frames for animated GIF previews.
+        extra_frames = image_data[3] if len(image_data) > 3 else None
+
         if max_size is not None:
             if hasattr(Image, 'Resampling'):
                 resampling = Image.Resampling.BILINEAR
             else:
                 resampling = Image.Resampling.LANCZOS
-
             image = ImageOps.contain(image, (max_size, max_size), resampling)
+            if extra_frames:
+                extra_frames = [ImageOps.contain(f, (max_size, max_size), resampling) for f in extra_frames]
+
+        # GIF uses type_num 2 (PNG slot); browsers auto-detect format from the GIF89a magic bytes.
         type_num = 1
         if image_type == "JPEG":
             type_num = 1
         elif image_type == "PNG":
             type_num = 2
+        elif image_type == "GIF":
+            type_num = 2
 
         bytesIO = BytesIO()
         header = struct.pack(">I", type_num)
         bytesIO.write(header)
-        image.save(bytesIO, format=image_type, quality=95, compress_level=1)
+        if image_type == "GIF" and extra_frames:
+            image.save(bytesIO, format="GIF", save_all=True, append_images=extra_frames,
+                       loop=0, duration=120, optimize=False)
+        else:
+            image.save(bytesIO, format=image_type, quality=95, compress_level=1)
         preview_bytes = bytesIO.getvalue()
         await self.send_bytes(BinaryEventTypes.PREVIEW_IMAGE, preview_bytes, sid=sid)
 
@@ -1191,15 +1203,23 @@ class PromptServer():
         image_type = image_data[0]
         image = image_data[1]
         max_size = image_data[2]
+        extra_frames = image_data[3] if len(image_data) > 3 else None
+
         if max_size is not None:
             if hasattr(Image, 'Resampling'):
                 resampling = Image.Resampling.BILINEAR
             else:
                 resampling = Image.Resampling.LANCZOS
-
             image = ImageOps.contain(image, (max_size, max_size), resampling)
+            if extra_frames:
+                extra_frames = [ImageOps.contain(f, (max_size, max_size), resampling) for f in extra_frames]
 
-        mimetype = "image/png" if image_type == "PNG" else "image/jpeg"
+        if image_type == "GIF":
+            mimetype = "image/gif"
+        elif image_type == "PNG":
+            mimetype = "image/png"
+        else:
+            mimetype = "image/jpeg"
 
         # Prepare metadata
         if metadata is None:
@@ -1213,7 +1233,11 @@ class PromptServer():
 
         # Prepare image data
         bytesIO = BytesIO()
-        image.save(bytesIO, format=image_type, quality=95, compress_level=1)
+        if image_type == "GIF" and extra_frames:
+            image.save(bytesIO, format="GIF", save_all=True, append_images=extra_frames,
+                       loop=0, duration=120, optimize=False)
+        else:
+            image.save(bytesIO, format=image_type, quality=95, compress_level=1)
         image_bytes = bytesIO.getvalue()
 
         # Combine metadata and image
