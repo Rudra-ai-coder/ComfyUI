@@ -44,10 +44,47 @@ class TAESDPreviewerImpl(LatentPreviewer):
         x_sample = self.taesd.decode(x0[:1])[0].movedim(0, 2)
         return preview_to_image(x_sample)
 
+def _decode_taehv_vae_frame_hwc(taesd_vae, latent_frame):
+    """Decode one video latent frame (1,C,1,H,W) to an (H,W,C) tensor."""
+    sample = taesd_vae.decode(latent_frame)[0][0]
+    if sample.ndim == 3 and sample.shape[0] in (1, 3):
+        return sample.movedim(0, -1)
+    return sample
+
+
+def _decode_taehv_vae_batch_nhwc(taesd_vae, x0):
+    """Decode a (N,C,H,W) latent batch to (N,H,W,C) for VHS animated previews."""
+    frames = []
+    for i in range(x0.shape[0]):
+        latent = x0[i:i + 1].unsqueeze(2)
+        frames.append(_decode_taehv_vae_frame_hwc(taesd_vae, latent))
+    return torch.stack(frames, dim=0)
+
+
 class TAEHVPreviewerImpl(TAESDPreviewerImpl):
     def decode_latent_to_preview(self, x0):
         x_sample = self.taesd.decode(x0[:1, :, :1])[0][0]
         return preview_to_image(x_sample, do_scale=False)
+
+    def decode_latent_to_preview_image(self, preview_format, x0):
+        """Filmstrip of evenly-spaced frames (static preview when VHS animated mode is off)."""
+        T = x0.shape[2] if x0.ndim == 5 else 1
+        N = min(T, 9)
+        if N <= 1:
+            return super().decode_latent_to_preview_image(preview_format, x0)
+
+        indices = [round(i * (T - 1) / (N - 1)) for i in range(N)]
+        frames = []
+        for fi in indices:
+            x_sample = self.taesd.decode(x0[:1, :, fi:fi + 1])[0][0]
+            frames.append(preview_to_image(x_sample, do_scale=False))
+
+        w, h = frames[0].size
+        strip = Image.new("RGB", (w * N, h))
+        for i, frame in enumerate(frames):
+            strip.paste(frame, (i * w, 0))
+        return ("JPEG", strip, MAX_PREVIEW_RESOLUTION)
+
 
 class Latent2RGBPreviewer(LatentPreviewer):
     def __init__(self, latent_rgb_factors, latent_rgb_factors_bias=None, latent_rgb_factors_reshape=None):
@@ -76,6 +113,7 @@ class Latent2RGBPreviewer(LatentPreviewer):
 
 
 def get_previewer(device, latent_format):
+    _patch_vhs_taehv_preview()
     previewer = None
     method = args.preview_method
     if method != LatentPreviewMethod.NoPreviews:
@@ -134,4 +172,33 @@ def set_preview_method(override: str = None):
             args.preview_method = method
             return
     args.preview_method = default_preview_method
+
+
+def _patch_vhs_taehv_preview():
+    """VHS WrappedPreviewer batch-decodes lighttaew/TAEHV latents incorrectly (5D tensor → interpolate crash)."""
+    try:
+        from videohelpersuite.latent_preview import WrappedPreviewer
+    except ImportError:
+        return
+    if getattr(WrappedPreviewer, "_comfyui_taehv_patched", False):
+        return
+
+    _orig_decode = WrappedPreviewer.decode_latent_to_preview
+
+    def _patched_decode_latent_to_preview(self, x0):
+        if hasattr(self, "taesd"):
+            if x0.ndim == 4 and x0.shape[0] > 0:
+                return _decode_taehv_vae_batch_nhwc(self.taesd, x0)
+            out = _orig_decode(self, x0)
+            if out.ndim == 5 and out.shape[-1] in (1, 3, 4):
+                return out.reshape(-1, out.shape[-3], out.shape[-2], out.shape[-1])
+            return out
+        return _orig_decode(self, x0)
+
+    WrappedPreviewer.decode_latent_to_preview = _patched_decode_latent_to_preview
+    WrappedPreviewer._comfyui_taehv_patched = True
+    logging.debug("Patched VideoHelperSuite preview decode for lighttaew/TAEHV")
+
+
+# Applied lazily from get_previewer() once VideoHelperSuite is loaded.
 
