@@ -227,18 +227,8 @@ def set_preview_method(override: str = None):
     args.preview_method = default_preview_method
 
 
-_vhs_wrapped_patched = False
-_taehv_bypass_done = False
-_vhs_latent_preview_module = None
-_patch_vhs_in_progress = False
-
-
 def _find_vhs_latent_preview_module():
     """Locate VideoHelperSuite latent_preview (import path varies by install)."""
-    global _vhs_latent_preview_module
-    if _vhs_latent_preview_module is not None:
-        return _vhs_latent_preview_module
-
     import sys
 
     for module_name in (
@@ -248,7 +238,6 @@ def _find_vhs_latent_preview_module():
     ):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "WrappedPreviewer"):
-            _vhs_latent_preview_module = module
             return module
 
     try:
@@ -261,20 +250,17 @@ def _find_vhs_latent_preview_module():
             try:
                 module = importlib.import_module(module_name)
                 if hasattr(module, "WrappedPreviewer"):
-                    _vhs_latent_preview_module = module
                     return module
             except ImportError:
                 continue
     except Exception:
         pass
 
-    # Snapshot keys — sys.modules can grow while other custom_nodes import concurrently.
-    for name in list(sys.modules):
-        module = sys.modules.get(name)
+    import sys
+    for module in sys.modules.values():
         if module is not None and hasattr(module, "WrappedPreviewer"):
             mod_file = getattr(module, "__file__", "") or ""
             if "videohelpersuite" in mod_file and "latent_preview" in mod_file:
-                _vhs_latent_preview_module = module
                 return module
     return None
 
@@ -306,69 +292,63 @@ def _install_taehv_vhs_bypass():
 
 def _patch_vhs_taehv_preview():
     """Fix VHS + lighttaew/TAEHV: batch decode yields 5D tensors that break F.interpolate."""
-    global _vhs_wrapped_patched, _taehv_bypass_done, _patch_vhs_in_progress
+    global _vhs_wrapped_patched, _taehv_bypass_done
 
-    if _vhs_wrapped_patched and _taehv_bypass_done:
-        return
-    if _patch_vhs_in_progress:
-        return
+    vhs_mod = _find_vhs_latent_preview_module()
 
-    _patch_vhs_in_progress = True
-    try:
-        vhs_mod = _find_vhs_latent_preview_module()
+    if vhs_mod is not None and not _vhs_wrapped_patched:
+        WrappedPreviewer = vhs_mod.WrappedPreviewer
+        import io
+        import struct
+        from PIL import Image
+        from server import PromptServer
+        import server
+        serv = PromptServer.instance
 
-        if vhs_mod is not None and not _vhs_wrapped_patched:
-            WrappedPreviewer = vhs_mod.WrappedPreviewer
-            import io
-            import struct
-            from PIL import Image
-            from server import PromptServer
-            import server
-            serv = PromptServer.instance
+        _orig_decode = WrappedPreviewer.decode_latent_to_preview
 
-            _orig_decode = WrappedPreviewer.decode_latent_to_preview
+        def _patched_decode_latent_to_preview(self, x0):
+            if hasattr(self, "taesd"):
+                if x0.ndim == 4 and x0.shape[0] > 0:
+                    return _decode_taehv_vae_batch_nhwc(self.taesd, x0)
+                out = _orig_decode(self, x0)
+                return _normalize_vhs_preview_tensor(out)
+            return _orig_decode(self, x0)
 
-            def _patched_decode_latent_to_preview(self, x0):
-                if hasattr(self, "taesd"):
-                    if x0.ndim == 4 and x0.shape[0] > 0:
-                        return _decode_taehv_vae_batch_nhwc(self.taesd, x0)
-                    out = _orig_decode(self, x0)
-                    return _normalize_vhs_preview_tensor(out)
-                return _orig_decode(self, x0)
+        def _patched_process_previews(self, image_tensor, ind, leng):
+            image_tensor = _patched_decode_latent_to_preview(self, image_tensor)
+            image_tensor = _normalize_vhs_preview_tensor(image_tensor)
+            image_tensor = _resize_vhs_preview_nhwc(image_tensor)
+            previews_ubyte = (
+                ((image_tensor + 1.0) / 2.0).clamp(0, 1).mul(0xFF)
+            ).to(device="cpu", dtype=torch.uint8)
+            for preview in previews_ubyte:
+                i = Image.fromarray(preview.numpy())
+                message = io.BytesIO()
+                message.write((1).to_bytes(length=4, byteorder="big") * 2)
+                message.write(ind.to_bytes(length=4, byteorder="big"))
+                message.write(struct.pack("16p", serv.last_node_id.encode("ascii")))
+                i.save(message, format="JPEG", quality=95, compress_level=1)
+                serv.send_sync(
+                    server.BinaryEventTypes.PREVIEW_IMAGE,
+                    message.getvalue(),
+                    serv.client_id,
+                )
+                ind = (ind + 1) % leng
 
-            def _patched_process_previews(self, image_tensor, ind, leng):
-                image_tensor = _patched_decode_latent_to_preview(self, image_tensor)
-                image_tensor = _normalize_vhs_preview_tensor(image_tensor)
-                image_tensor = _resize_vhs_preview_nhwc(image_tensor)
-                previews_ubyte = (
-                    ((image_tensor + 1.0) / 2.0).clamp(0, 1).mul(0xFF)
-                ).to(device="cpu", dtype=torch.uint8)
-                for preview in previews_ubyte:
-                    i = Image.fromarray(preview.numpy())
-                    message = io.BytesIO()
-                    message.write((1).to_bytes(length=4, byteorder="big") * 2)
-                    message.write(ind.to_bytes(length=4, byteorder="big"))
-                    message.write(struct.pack("16p", serv.last_node_id.encode("ascii")))
-                    i.save(message, format="JPEG", quality=95, compress_level=1)
-                    serv.send_sync(
-                        server.BinaryEventTypes.PREVIEW_IMAGE,
-                        message.getvalue(),
-                        serv.client_id,
-                    )
-                    ind = (ind + 1) % leng
+        WrappedPreviewer.decode_latent_to_preview = _patched_decode_latent_to_preview
+        WrappedPreviewer.process_previews = _patched_process_previews
+        _vhs_wrapped_patched = True
+        logging.info("Bernini/ComfyUI: patched VideoHelperSuite WrappedPreviewer for lighttaew/TAEHV")
 
-            WrappedPreviewer.decode_latent_to_preview = _patched_decode_latent_to_preview
-            WrappedPreviewer.process_previews = _patched_process_previews
-            _vhs_wrapped_patched = True
-            logging.info("Bernini/ComfyUI: patched VideoHelperSuite WrappedPreviewer for lighttaew/TAEHV")
+    if not _taehv_bypass_done:
+        if _install_taehv_vhs_bypass():
+            _taehv_bypass_done = True
+            logging.info("Bernini/ComfyUI: TAEHV preview bypasses VHS animated preview wrapper")
 
-        if not _taehv_bypass_done:
-            if _install_taehv_vhs_bypass():
-                _taehv_bypass_done = True
-                logging.info("Bernini/ComfyUI: TAEHV preview bypasses VHS animated preview wrapper")
-    finally:
-        _patch_vhs_in_progress = False
 
+_vhs_wrapped_patched = False
+_taehv_bypass_done = False
 
 # Retry when VHS loads after this module (common with custom_nodes).
 try:
