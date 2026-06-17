@@ -50,9 +50,9 @@ class TAEHVPreviewerImpl(TAESDPreviewerImpl):
         return preview_to_image(x_sample, do_scale=False)
 
     def decode_latent_to_preview_image(self, preview_format, x0):
-        """Return a horizontal filmstrip of evenly-spaced video frames as a single JPEG."""
+        """Return an animated GIF preview cycling through evenly-spaced video frames."""
         T = x0.shape[2] if x0.ndim == 5 else 1
-        N = min(T, 9)  # up to 9 frames in the strip
+        N = min(T, 8)  # up to 8 frames in the loop
         if N <= 1:
             return super().decode_latent_to_preview_image(preview_format, x0)
 
@@ -62,12 +62,9 @@ class TAEHVPreviewerImpl(TAESDPreviewerImpl):
             x_sample = self.taesd.decode(x0[:1, :, fi:fi+1])[0][0]
             frames.append(preview_to_image(x_sample, do_scale=False))
 
-        # Paste frames side-by-side into one wide JPEG strip.
-        w, h = frames[0].size
-        strip = Image.new("RGB", (w * N, h))
-        for i, f in enumerate(frames):
-            strip.paste(f, (i * w, 0))
-        return ("JPEG", strip, MAX_PREVIEW_RESOLUTION)
+        # Return animated GIF: first frame + extra frames as 4th tuple element.
+        # server.send_image handles the 4-element tuple and saves with save_all=True.
+        return ("GIF", frames[0], MAX_PREVIEW_RESOLUTION, frames[1:])
 
 class Latent2RGBPreviewer(LatentPreviewer):
     def __init__(self, latent_rgb_factors, latent_rgb_factors_bias=None, latent_rgb_factors_reshape=None):
