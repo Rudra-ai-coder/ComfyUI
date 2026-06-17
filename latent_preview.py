@@ -152,7 +152,14 @@ def prepare_callback(model, steps, x0_output_dict=None):
         preview_bytes = None
         if previewer:
             try:
-                preview_bytes = previewer.decode_latent_to_preview_image(preview_format, x0)
+                # For 5-D video latents, bypass any third-party override (e.g. VideoHelperSuite)
+                # by calling our TAEHVPreviewerImpl method directly via the class, not the instance.
+                # VHS subclasses TAEHVPreviewerImpl and replaces decode_latent_to_preview_image
+                # with an image-only implementation that crashes on 3-spatial-dim tensors.
+                if x0.ndim == 5 and isinstance(previewer, TAEHVPreviewerImpl):
+                    preview_bytes = TAEHVPreviewerImpl.decode_latent_to_preview_image(previewer, preview_format, x0)
+                else:
+                    preview_bytes = previewer.decode_latent_to_preview_image(preview_format, x0)
             except Exception as e:
                 logging.warning("latent_preview: previewer failed (step %d): %s", step, e)
         pbar.update_absolute(step + 1, total_steps, preview_bytes)
