@@ -72,16 +72,11 @@ class BerniniConditioning(io.ComfyNode):
         )
 
     @classmethod
-<<<<<<< HEAD
     def execute(cls, positive, negative, vae, width, height, length, batch_size,
                 source_video=None, reference_video=None, reference_images=None, ref_max_size=848,
                 max_trained_src_id=5, interpolate_src_id=True) -> io.NodeOutput:
         latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8],
                              device=comfy.model_management.intermediate_device())
-=======
-    def execute(cls, positive, negative, vae, width, height, length, batch_size, source_video=None, reference_video=None, reference_images=None, ref_max_size=848) -> io.NodeOutput:
-        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
->>>>>>> ca3dbe206c2fea84f2af4371ca13e9f2bfeb82e5
 
         # source_video (1), reference_video (2), reference_images (3, 4, ...).
         context = []
