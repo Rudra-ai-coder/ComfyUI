@@ -200,12 +200,15 @@ class BerniniVitDecoderLoader(io.ComfyNode):
     def execute(cls, path) -> io.NodeOutput:
         sd = _load_split_state_dict(path)
         vit_sd = {k.removeprefix("vit_decoder."): v for k, v in sd.items() if k.startswith("vit_decoder.")}
+        # Official BerniniModel: extra_one_step=config.clip_diff_cfg.get("extra_one_step", True).
+        # Config omits the key → True. Changes the FlowMatch sigma grid inside MaskGIT.
         vit_decoder = DiffLoss_FM(
             z_channels=3584,
             target_channels=3584,
             depth=16,
             width=4096,
             shift=2.0,
+            extra_one_step=True,
         )
         missing, unexpected = vit_decoder.load_state_dict(vit_sd, strict=False)
         if missing:

@@ -17,7 +17,7 @@ from comfy.bernini.guidance import (
     chained_cfg_rv2v,
     chained_cfg_v2v_chain,
     normalized_guidance,
-    vae_txt_vit_wapg,
+    vae_txt_vit_wapg_from_x0,
 )
 from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
@@ -79,7 +79,14 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
 
     def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None):
         self._omega_scaled = False
+        # Persist across denoising steps (official creates buffers once outside the loop).
+        self._momentum_buffers = [MomentumBuffer(self.momentum)]
         return super().sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
+
+    def _momentum_buffer(self) -> MomentumBuffer:
+        if not self._momentum_buffers:
+            self._momentum_buffers = [MomentumBuffer(self.momentum)]
+        return self._momentum_buffers[0]
 
     def _scaled_omegas(self, timestep):
         # ComfyUI sigmas are in [0, 1]; compare directly to switch_dit_boundary (also 0–1).
@@ -135,24 +142,28 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
 
         if mode == "vae_txt_vit_wapg":
             branches = self._build_wvitcfg_conds(positive_cond)
-            eps_base = _calc_one(self.inner_model, branches["base"], x, timestep, model_options)
+            # calc_cond_batch returns x0 (CONST.calculate_denoised). Official applies
+            # apg_delta on velocity; convert x0 → v, APG, then v → x0 for the sampler.
+            x0_base = _calc_one(self.inner_model, branches["base"], x, timestep, model_options)
             if img_omega > 0.0:
-                eps_img = _calc_one(self.inner_model, branches["img"], x, timestep, model_options)
+                x0_img = _calc_one(self.inner_model, branches["img"], x, timestep, model_options)
             else:
-                eps_img = eps_base
+                x0_img = x0_base
             if txt_omega > 0.0:
-                eps_txt = _calc_one(self.inner_model, branches["txt"], x, timestep, model_options)
+                x0_txt = _calc_one(self.inner_model, branches["txt"], x, timestep, model_options)
             else:
-                eps_txt = eps_img
+                x0_txt = x0_img
             if tgt_omega > 0.0:
-                eps_vit = _calc_one(self.inner_model, branches["vit"], x, timestep, model_options)
+                x0_vit = _calc_one(self.inner_model, branches["vit"], x, timestep, model_options)
             else:
-                eps_vit = eps_txt
-            return vae_txt_vit_wapg(
-                eps_base,
-                eps_img,
-                eps_txt,
-                eps_vit,
+                x0_vit = x0_txt
+            return vae_txt_vit_wapg_from_x0(
+                x,
+                timestep,
+                x0_base,
+                x0_img,
+                x0_txt,
+                x0_vit,
                 img_omega,
                 txt_omega,
                 tgt_omega,
@@ -170,10 +181,11 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         if mode == "t2v_apg":
             eps_u = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)
             eps_t = _calc_one(self.inner_model, branches["t_pos"], x, timestep, model_options)
-            # ComfyUI's apply_model (CONST.calculate_denoised) already converts velocity → x0,
-            # so eps_u/eps_t are denoised x0 estimates. Apply APG directly in x0-space.
-            mb = MomentumBuffer(self.momentum)
-            return normalized_guidance(eps_t, eps_u, txt_omega, mb, self.eta, self.norm_threshold)
+            # Official converts v→x0, runs normalized_guidance, converts back. ComfyUI
+            # already has x0 from apply_model; return x0 (sampler stays in denoised space).
+            return normalized_guidance(
+                eps_t, eps_u, txt_omega, self._momentum_buffer(), self.eta, self.norm_threshold
+            )
 
         if mode == "v2v":
             eps_u = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
@@ -183,10 +195,10 @@ class Guider_Bernini(comfy.samplers.CFGGuider):
         if mode == "v2v_apg":
             eps_u = _calc_one(self.inner_model, branches["vi_neg"], x, timestep, model_options)
             eps_t = _calc_one(self.inner_model, branches["vi_pos"], x, timestep, model_options)
-            # ComfyUI's apply_model (CONST.calculate_denoised) already converts velocity → x0,
-            # so eps_u/eps_t are denoised x0 estimates. Apply APG directly in x0-space.
-            mb = MomentumBuffer(self.momentum)
-            return normalized_guidance(eps_t, eps_u, txt_omega, mb, self.eta, self.norm_threshold)
+            # Same as t2v_apg: APG in x0-space matches official Bernini-R sample().
+            return normalized_guidance(
+                eps_t, eps_u, txt_omega, self._momentum_buffer(), self.eta, self.norm_threshold
+            )
 
         if mode == "v2v_chain":
             eps_none = _calc_one(self.inner_model, branches["none_neg"], x, timestep, model_options)

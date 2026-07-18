@@ -10,7 +10,15 @@ sys.path.insert(0, str(ROOT))
 import torch
 
 from comfy.bernini.context import make_source_ids, split_context_branches, build_branch_cond_list, get_branch_cross_attn
-from comfy.bernini.guidance import apg_delta, chained_cfg_rv2v, normalized_guidance, vae_txt_vit_wapg
+from comfy.bernini.guidance import (
+    apg_delta,
+    chained_cfg_rv2v,
+    normalized_guidance,
+    vae_txt_vit_wapg,
+    vae_txt_vit_wapg_from_x0,
+    velocity_to_x0,
+    x0_to_velocity,
+)
 from comfy.bernini.text import merge_t5_planner, pad_and_truncate_feat
 
 
@@ -56,6 +64,53 @@ def test_vae_txt_vit_wapg():
     assert out.shape == base.shape
 
 
+def test_x0_velocity_roundtrip():
+    x = torch.randn(1, 4, 8, 8)
+    v = torch.randn_like(x)
+    sigma = torch.tensor(0.7)
+    x0 = velocity_to_x0(x, v, sigma)
+    v2 = x0_to_velocity(x, x0, sigma)
+    assert torch.allclose(v, v2, atol=1e-5)
+
+
+def test_vae_txt_vit_wapg_velocity_vs_x0_space():
+    """APG is not affine-invariant: velocity-space result must differ from naive x0 APG."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 2, 4, 4)
+    sigma = torch.tensor(0.6)
+    v_base = torch.randn_like(x)
+    v_img = v_base + 0.3 * torch.randn_like(x)
+    v_txt = v_img + 0.3 * torch.randn_like(x)
+    v_vit = v_txt + 0.3 * torch.randn_like(x)
+    x0_base = velocity_to_x0(x, v_base, sigma)
+    x0_img = velocity_to_x0(x, v_img, sigma)
+    x0_txt = velocity_to_x0(x, v_txt, sigma)
+    x0_vit = velocity_to_x0(x, v_vit, sigma)
+
+    x0_official = vae_txt_vit_wapg_from_x0(
+        x, sigma, x0_base, x0_img, x0_txt, x0_vit, 1.0, 1.0, 1.0,
+        parallel_scale=0.2, orthogonal_scale=1.0,
+    )
+    x0_naive = vae_txt_vit_wapg(
+        x0_base, x0_img, x0_txt, x0_vit, 1.0, 1.0, 1.0,
+        parallel_scale=0.2, orthogonal_scale=1.0,
+    )
+    assert not torch.allclose(x0_official, x0_naive, atol=1e-4)
+
+    # With parallel=orthogonal=1, APG is identity → spaces agree after roundtrip.
+    x0_full = vae_txt_vit_wapg_from_x0(
+        x, sigma, x0_base, x0_img, x0_txt, x0_vit, 1.0, 1.0, 1.0,
+        parallel_scale=1.0, orthogonal_scale=1.0,
+    )
+    x0_plain = (
+        x0_base
+        + 1.0 * (x0_img - x0_base)
+        + 1.0 * (x0_txt - x0_img)
+        + 1.0 * (x0_vit - x0_txt)
+    )
+    assert torch.allclose(x0_full, x0_plain, atol=1e-5)
+
+
 def test_merge_pad_truncate():
     t5 = torch.randn(1, 100, 4096)
     planner = torch.randn(1, 450, 4096)
@@ -93,6 +148,8 @@ def main():
     test_apg()
     test_apg_delta()
     test_vae_txt_vit_wapg()
+    test_x0_velocity_roundtrip()
+    test_vae_txt_vit_wapg_velocity_vs_x0_space()
     test_merge_pad_truncate()
     test_make_source_ids()
     test_branch_cross_attn()

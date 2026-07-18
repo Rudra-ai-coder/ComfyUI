@@ -96,6 +96,29 @@ def apg_delta(
     )
 
 
+def _broadcast_sigma(sigma: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Reshape ComfyUI sigma/timestep for broadcasting against a latent tensor."""
+    if not torch.is_tensor(sigma):
+        sigma = torch.tensor(sigma, device=target.device, dtype=target.dtype)
+    else:
+        sigma = sigma.to(device=target.device, dtype=target.dtype)
+    if sigma.nelement() == 1:
+        return sigma.reshape((1,) * target.ndim)
+    return sigma.view(sigma.shape[:1] + (1,) * (target.ndim - 1))
+
+
+def x0_to_velocity(x: torch.Tensor, x0: torch.Tensor, sigma: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """CONST/FLOW: x0 = x - sigma * v  ⇒  v = (x - x0) / sigma."""
+    sigma_b = _broadcast_sigma(sigma, x0).clamp_min(eps)
+    return (x - x0) / sigma_b
+
+
+def velocity_to_x0(x: torch.Tensor, velocity: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    """CONST/FLOW: x0 = x - sigma * v."""
+    sigma_b = _broadcast_sigma(sigma, velocity)
+    return x - sigma_b * velocity
+
+
 def vae_txt_vit_wapg(
     eps_base,
     eps_img,
@@ -107,7 +130,44 @@ def vae_txt_vit_wapg(
     parallel_scale=0.2,
     orthogonal_scale=1.0,
 ):
+    """Chained APG over base → img → txt → vit.
+
+    Official Bernini applies this in **velocity** space. Pass velocity predictions
+    (not x0) for parity; the ComfyUI guider converts x0 ↔ v around this helper.
+    """
     delta_img = apg_delta(eps_img - eps_base, ref=eps_img, parallel_scale=parallel_scale, orthogonal_scale=orthogonal_scale)
     delta_txt = apg_delta(eps_txt - eps_img, ref=eps_txt, parallel_scale=parallel_scale, orthogonal_scale=orthogonal_scale)
     delta_vit = apg_delta(eps_vit - eps_txt, ref=eps_vit, parallel_scale=parallel_scale, orthogonal_scale=orthogonal_scale)
     return eps_base + omega_img * delta_img + omega_txt * delta_txt + omega_tgt * delta_vit
+
+
+def vae_txt_vit_wapg_from_x0(
+    x,
+    sigma,
+    x0_base,
+    x0_img,
+    x0_txt,
+    x0_vit,
+    omega_img,
+    omega_txt,
+    omega_tgt,
+    parallel_scale=0.2,
+    orthogonal_scale=1.0,
+):
+    """ComfyUI entry: APG in velocity space, return denoised x0 for the sampler."""
+    v_base = x0_to_velocity(x, x0_base, sigma)
+    v_img = x0_to_velocity(x, x0_img, sigma)
+    v_txt = x0_to_velocity(x, x0_txt, sigma)
+    v_vit = x0_to_velocity(x, x0_vit, sigma)
+    v_guided = vae_txt_vit_wapg(
+        v_base,
+        v_img,
+        v_txt,
+        v_vit,
+        omega_img,
+        omega_txt,
+        omega_tgt,
+        parallel_scale=parallel_scale,
+        orthogonal_scale=orthogonal_scale,
+    )
+    return velocity_to_x0(x, v_guided, sigma)
