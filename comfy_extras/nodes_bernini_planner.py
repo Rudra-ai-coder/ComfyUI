@@ -245,8 +245,9 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                              tooltip="Max pixels per frame/image (lower = faster encode). "
                                      "Official default ~50176; 25088 is a good speed/quality trade-off."),
                 io.Int.Input("video_fps", default=16, min=1, max=120, advanced=True,
-                             tooltip="FPS of the input source_video tensor (typically matches your vae_fps). "
-                                     "Used to compute how many frames to sub-sample for VIT encoding."),
+                             tooltip="FPS of the input source_video / reference_video tensors "
+                                     "(typically matches your vae_fps). Used to compute how many "
+                                     "frames to sub-sample for VIT encoding."),
                 io.Int.Input("vit_fps", default=2, min=1, max=30, advanced=True,
                              tooltip="Target FPS for VIT visual encoding (official default 2). "
                                      "Frames sent to VIT = total_frames × vit_fps / video_fps."),
@@ -256,7 +257,14 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                     default="",
                     tooltip="Planner uncond branch negative (official run_v2v.sh default).",
                 ),
-                io.Image.Input("source_video", optional=True, tooltip="Source video for v2v/rv2v."),
+                io.Image.Input("source_video", optional=True, tooltip="Source video to edit (v2v/rv2v/ads2v)."),
+                io.Image.Input(
+                    "reference_video",
+                    optional=True,
+                    tooltip="Optional second video (ads2v / multi-video). Encoded as its own "
+                            "planner video slot after source_video, matching official video=[src, ref]. "
+                            "Keep native aspect; long-edge resize is handled by the VIT processor.",
+                ),
                 io.Autogrow.Input(
                     "reference_images",
                     optional=True,
@@ -282,6 +290,7 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         length,
         neg_prompt="",
         source_video=None,
+        reference_video=None,
         reference_images=None,
         vit_min_pixels=3136,
         vit_max_pixels=25088,
@@ -294,10 +303,12 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                   neg_prompt, str(vit_min_pixels), str(vit_max_pixels),
                   str(video_fps), str(vit_fps)):
             h.update(v.encode())
-        if source_video is not None:
-            h.update(struct.pack("q", source_video.shape[0]))
-            step = max(1, source_video.shape[0] // 8)
-            h.update(source_video[::step].cpu().numpy().tobytes())
+        for tag, vid in (("src", source_video), ("ref", reference_video)):
+            if vid is not None:
+                h.update(tag.encode())
+                h.update(struct.pack("q", vid.shape[0]))
+                step = max(1, vid.shape[0] // 8)
+                h.update(vid[::step].cpu().numpy().tobytes())
         if reference_images:
             for name in sorted(reference_images):
                 imgs = reference_images[name]
@@ -317,6 +328,7 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
         length,
         neg_prompt="",
         source_video=None,
+        reference_video=None,
         reference_images=None,
         vit_min_pixels=3136,
         vit_max_pixels=25088,
@@ -335,27 +347,37 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
                     for i in range(imgs.shape[0]):
                         ref_image_list.append(imgs[i : i + 1])
 
-        num_videos = 0
-        video_embeds, video_grid_thw = [], []
-        source_video_ve, source_video_vg = None, None
+        # Official pipeline accepts video as a list: [source, reference, ...].
+        # Encode each as its own VIT video slot; conversation JSON gets one "video"
+        # entry per input, then a separate video_gen output slot.
+        input_videos = []
         if source_video is not None:
-            num_videos = 1
-            vit_frames = max(2, int(source_video.shape[0] * vit_fps / max(video_fps, 1)) // 2 * 2)
+            input_videos.append(("source", source_video))
+        if reference_video is not None:
+            input_videos.append(("reference", reference_video))
+
+        num_videos = len(input_videos)
+        video_embeds, video_grid_thw = [], []
+        first_video_ve, first_video_vg = None, None
+        for label, video in input_videos:
+            vit_frames = max(2, int(video.shape[0] * vit_fps / max(video_fps, 1)) // 2 * 2)
             LOG.info(
-                "BerniniPreparePlannerInputs: encoding source video (%d frames @ %dfps "
+                "BerniniPreparePlannerInputs: encoding %s video (%d frames @ %dfps "
                 "→ %d VIT frames @ %dfps, vit_max_pixels=%d)",
-                source_video.shape[0], video_fps, vit_frames, vit_fps, vit_max_pixels,
+                label, video.shape[0], video_fps, vit_frames, vit_fps, vit_max_pixels,
             )
-            source_video_ve, source_video_vg = mllm.encode_videos(
-                [source_video],
+            ve, vg = mllm.encode_videos(
+                [video],
                 vit_min_pixels=vit_min_pixels,
                 vit_max_pixels=vit_max_pixels,
                 vit_fps=vit_fps,
                 video_fps=video_fps,
                 max_frames=length,
             )
-            video_embeds.extend(source_video_ve)
-            video_grid_thw.extend(source_video_vg)
+            if first_video_ve is None:
+                first_video_ve, first_video_vg = ve, vg
+            video_embeds.extend(ve)
+            video_grid_thw.extend(vg)
 
         image_embeds, image_grid_thw = [], []
         if ref_image_list:
@@ -384,10 +406,10 @@ class BerniniPreparePlannerInputs(io.ComfyNode):
             image_embeds.extend(ie)
             image_grid_thw.extend(ig)
         else:
-            if source_video is not None:
-                # Reuse input encode — same grid_thw, saves a full visual forward pass.
-                ve, vg = source_video_ve, source_video_vg
-                LOG.info("BerniniPreparePlannerInputs: output video placeholder reused from source (skipped re-encode)")
+            if first_video_ve is not None:
+                # Official reuses video_meta[0] (first input video) for the output slot.
+                ve, vg = first_video_ve, first_video_vg
+                LOG.info("BerniniPreparePlannerInputs: output video placeholder reused from first input video (skipped re-encode)")
             else:
                 LOG.info(
                     "BerniniPreparePlannerInputs: encoding fake output video placeholder (%d frames, vit_max_pixels=%d)",
