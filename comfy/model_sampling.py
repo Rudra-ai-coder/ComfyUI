@@ -378,6 +378,25 @@ class ModelSamplingAV(ModelSamplingDiscreteFlow):
         cols = coeff_sq(self._column_sigmas(s_from, noise.device), self._column_sigmas(s_to, noise.device))
         return noise * (cols.clamp(min=0.0).sqrt() / base ** 0.5)
 
+    def physical_denoised(self, denoised, x, sigma):
+        # calculate_denoised returns the ODE-schedule prediction x - σ_v * v_sv
+        # (needed by euler/DPM++ on the flattened video schedule). Jump-to-x0
+        # samplers like LCM need the per-stream physical x0 = x - σ_stream * v_raw.
+        if self.latent_shapes is None:
+            return denoised
+        s = float(sigma)
+        if s <= 0.0:
+            return denoised
+        shift_a = self.shift if self.audio_shift is None else self.audio_shift
+        base = s / (self.shift + s * (1.0 - self.shift))
+        slope_a = (shift_a * (1.0 + (self.shift - 1.0) * base) ** 2) / (self.shift * (1.0 + (shift_a - 1.0) * base) ** 2)
+        slopes = [torch.full((math.prod(shape[1:]),), v, device=denoised.device)
+                  for shape, v in zip(self.latent_shapes, (1.0, slope_a))]
+        slopes = torch.cat(slopes).reshape(1, 1, -1)
+        beta = self._column_sigmas(s, denoised.device) / (slopes * s)
+        beta = beta.to(dtype=denoised.dtype)
+        return x * (1.0 - beta) + denoised * beta
+
 class StableCascadeSampling(ModelSamplingDiscrete):
     def __init__(self, model_config=None):
         super().__init__()

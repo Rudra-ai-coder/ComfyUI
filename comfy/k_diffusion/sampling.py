@@ -1034,10 +1034,12 @@ def sample_lcm(model, x, sigmas, extra_args=None, callback=None, disable=None, n
 
     extra_args = {} if extra_args is None else extra_args
     seed = extra_args.get("seed", None)
-    noise_sampler = default_noise_sampler(x, seed=seed, model=model) if noise_sampler is None else noise_sampler
+    # LCM renoises via noise_scaling (σ * eps); do not apply scale_stochastic_noise
+    noise_sampler = default_noise_sampler(x, seed=seed) if noise_sampler is None else noise_sampler
     s_in = x.new_ones([x.shape[0]])
     n_steps = max(1, len(sigmas) - 1)
     model_sampling = model.inner_model.model_patcher.get_model_object('model_sampling')
+    physical_denoised = getattr(model_sampling, "physical_denoised", None)
 
     s_start = float(s_noise)
     s_end = s_start if s_noise_end is None else float(s_noise_end)
@@ -1046,6 +1048,9 @@ def sample_lcm(model, x, sigmas, extra_args=None, callback=None, disable=None, n
         if callback is not None:
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
 
+        # jump-to-x0 needs per-stream physical x0; ODE samplers keep schedule denoised
+        if physical_denoised is not None:
+            denoised = physical_denoised(denoised, x, sigmas[i])
         x = denoised
         if sigmas[i + 1] > 0:
             noise = noise_sampler(sigmas[i], sigmas[i + 1])
