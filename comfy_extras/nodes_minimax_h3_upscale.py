@@ -1,6 +1,7 @@
 """MiniMax H3 local upscale / in-context regenerate helpers.
 
 Official H3-Regenerate-2K is not open-sourced. These nodes approximate it:
+- Encode AV: IMAGE frames + AUDIO -> NestedTensor AV latent
 - Upscale Latent: spatially upscale a previous AV NestedTensor for a low-sigma refine
 - Regenerate: decode the previous sample, attach as Ref2VA <Audio 1>/<Video 1>,
   and prepare a target-resolution latent (upscaled or empty)
@@ -8,6 +9,7 @@ Official H3-Regenerate-2K is not open-sourced. These nodes approximate it:
 Does not modify the core MiniMax H3 conditioning nodes.
 """
 
+import torch
 import torchaudio
 
 import nodes
@@ -39,6 +41,36 @@ def _target_pixel_size(lh, lw, scale_by, width, height):
         tw = max(m, round(width / m) * m)
         th = max(m, round(height / m) * m)
     return tw, th
+
+
+def _align_frame_count_down(n):
+    """Snap frame count down to the H3 17k+5 grid (same as reference video packing)."""
+    n = int(n)
+    if n < 5:
+        raise ValueError("MiniMax H3 needs at least 5 frames (~0.2s at 24 fps)")
+    while n % 17 != 5:
+        n -= 1
+    if n < 5:
+        raise ValueError("MiniMax H3 needs at least 5 frames on the 17k+5 grid")
+    return n
+
+
+def _prepare_stereo_waveform(audio, sample_rate, num_samples):
+    """Resample to sample_rate, force stereo [1, 2, L], trim/pad to num_samples."""
+    waveform = audio["waveform"][:1]  # [1, C, L]
+    sr = audio["sample_rate"]
+    if sr != sample_rate:
+        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
+    if waveform.shape[1] == 1:
+        waveform = waveform.repeat(1, 2, 1)
+    elif waveform.shape[1] > 2:
+        waveform = waveform[:, :2]
+    cur = waveform.shape[-1]
+    if cur < num_samples:
+        waveform = torch.nn.functional.pad(waveform, (0, num_samples - cur))
+    elif cur > num_samples:
+        waveform = waveform[..., :num_samples]
+    return waveform
 
 
 def _encode_ref_audio(audio_vae, audio):
@@ -87,6 +119,64 @@ def _frame_count_from_video_latent(latent_t):
     if latent_t <= 2:
         return h3.align_frame_count(5)
     return h3.align_frame_count(((latent_t - 2) // 5) * 17 + 5)
+
+
+class MiniMaxH3EncodeAV(io.ComfyNode):
+    """Encode IMAGE frames + AUDIO into a MiniMax H3 NestedTensor AV latent."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3EncodeAV",
+            display_name="MiniMax H3 Encode AV",
+            search_aliases=["minimax encode", "video audio to latent", "av encode"],
+            category="model/latent/minimax",
+            description="Encode video frames and audio into a joint MiniMax H3 AV latent.",
+            inputs=[
+                io.Image.Input("images", tooltip="Video frames at 24 fps (IMAGE batch)"),
+                io.Audio.Input("audio", tooltip="Soundtrack paired with the video"),
+                io.Vae.Input("vae", tooltip="MiniMax H3 video VAE"),
+                io.Vae.Input("audio_vae", tooltip="MiniMax H3 audio VAE"),
+                io.Int.Input("width", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
+                    tooltip="Target pixel width (0 = use image width, rounded to ×32)"),
+                io.Int.Input("height", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
+                    tooltip="Target pixel height (0 = use image height, rounded to ×32)"),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, images, audio, vae, audio_vae, width=0, height=0) -> io.NodeOutput:
+        if images is None or images.shape[0] < 5:
+            raise ValueError("MiniMax H3 Encode AV needs at least 5 frames (~0.2s at 24 fps)")
+        if audio is None:
+            raise ValueError("MiniMax H3 Encode AV requires audio")
+
+        n = _align_frame_count_down(images.shape[0])
+        frames = images[:n]
+        ih, iw = frames.shape[1], frames.shape[2]
+        m = h3.CANVAS_MULTIPLE
+        if width <= 0:
+            width = max(m, round(iw / m) * m)
+        else:
+            width = max(m, round(width / m) * m)
+        if height <= 0:
+            height = max(m, round(ih / m) * m)
+        else:
+            height = max(m, round(height / m) * m)
+        if frames.shape[1] != height or frames.shape[2] != width:
+            frames = h3._resize(frames, width, height, "disabled")
+
+        video_z = vae.encode(frames)
+
+        _, _, audio_t = h3.temporal_shape(n)
+        vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
+        # exact multiple of hop (sr / AUDIO_LATENT_FPS) so encode T matches empty-AV audio_t
+        waveform = _prepare_stereo_waveform(audio, vae_sr, audio_t * (vae_sr // h3.AUDIO_LATENT_FPS))
+        # same encode convention as MiniMaxH3ReferenceToVideo / VAEEncodeAudio
+        audio_z = audio_vae.encode(waveform.movedim(1, -1))
+
+        return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor((video_z, audio_z))})
 
 
 class MiniMaxH3UpscaleLatent(io.ComfyNode):
@@ -202,6 +292,7 @@ class MiniMaxH3Regenerate(io.ComfyNode):
 class MiniMaxH3UpscaleExtension(ComfyExtension):
     async def get_node_list(self):
         return [
+            MiniMaxH3EncodeAV,
             MiniMaxH3UpscaleLatent,
             MiniMaxH3Regenerate,
         ]
