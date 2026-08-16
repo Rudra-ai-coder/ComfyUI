@@ -34,6 +34,7 @@ from comfy_api.latest import io, ComfyExtension, InputImpl
 import comfy.clip_vision
 
 import comfy.model_management
+import comfy.nested_tensor
 from comfy.cli_args import args
 
 import importlib
@@ -550,7 +551,13 @@ class SaveLatent:
         file = os.path.join(full_output_folder, file)
 
         output = {}
-        output["latent_tensor"] = samples["samples"].contiguous()
+        t = samples["samples"]
+        if getattr(t, "is_nested", False):
+            for i, stream in enumerate(t.unbind()):
+                key = "latent_tensor" if i == 0 else "latent_nested_{}".format(i)
+                output[key] = stream.contiguous()
+        else:
+            output["latent_tensor"] = t.contiguous()
         output["latent_format_version_0"] = torch.tensor([])
 
         comfy.utils.save_torch_file(output, file, metadata=metadata)
@@ -577,7 +584,16 @@ class LoadLatent:
         multiplier = 1.0
         if "latent_format_version_0" not in latent:
             multiplier = 1.0 / 0.18215
-        samples = {"samples": latent["latent_tensor"].float() * multiplier}
+        first = latent["latent_tensor"].float() * multiplier
+        extras = []
+        i = 1
+        while "latent_nested_{}".format(i) in latent:
+            extras.append(latent["latent_nested_{}".format(i)].float() * multiplier)
+            i += 1
+        if extras:
+            samples = {"samples": comfy.nested_tensor.NestedTensor([first] + extras)}
+        else:
+            samples = {"samples": first}
         return (samples, )
 
     @classmethod

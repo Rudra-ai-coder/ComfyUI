@@ -54,6 +54,12 @@ class NestedTensor:
     def cpu(self):
         return self.to(device="cpu")
 
+    def contiguous(self, *args, **kwargs):
+        o = self._copy()
+        for i, t in enumerate(o.tensors):
+            o.tensors[i] = t.contiguous(*args, **kwargs)
+        return o
+
     def chunk(self, *args, **kwargs):
         return self.apply_operation(None, lambda x, y: x.chunk(*args, **kwargs))
 
