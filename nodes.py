@@ -564,14 +564,69 @@ class SaveLatent:
         return { "ui": { "latents": results }, "result": (samples,) }
 
 
+def _samples_from_latent_file(latent_path):
+    latent = safetensors.torch.load_file(latent_path, device="cpu")
+    multiplier = 1.0
+    if "latent_format_version_0" not in latent:
+        multiplier = 1.0 / 0.18215
+    first = latent["latent_tensor"].float() * multiplier
+    extras = []
+    i = 1
+    while "latent_nested_{}".format(i) in latent:
+        extras.append(latent["latent_nested_{}".format(i)].float() * multiplier)
+        i += 1
+    if extras:
+        return {"samples": comfy.nested_tensor.NestedTensor([first] + extras)}
+    return {"samples": first}
+
+
+def _list_latent_combo_files():
+    files = []
+    for folder, tag in (("input", None), ("output", "output"), ("temp", "temp")):
+        base = folder_paths.get_directory_by_type(folder)
+        if not base or not os.path.isdir(base):
+            continue
+        for root, dirnames, filenames in os.walk(base, followlinks=True):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith(".") or not fn.endswith(".latent"):
+                    continue
+                full = os.path.abspath(os.path.join(root, fn))
+                if not folder_paths.is_within_directory(base, full):
+                    continue
+                rel = os.path.relpath(full, base).replace(os.sep, "/")
+                files.append("{} [{}]".format(rel, tag) if tag else rel)
+    return sorted(files)
+
+
+def _validate_latent_combo(latent):
+    if not isinstance(latent, str):
+        return "Invalid latent file: {}".format(latent)
+    name, _ = folder_paths.annotated_filepath(latent)
+    if not name.endswith(".latent"):
+        return "Invalid latent file: {}".format(latent)
+    if not folder_paths.exists_annotated_filepath(latent):
+        return "Invalid latent file: {}".format(latent)
+    return True
+
+
+def _annotated_latent_path(folder, path):
+    if folder not in ("input", "output", "temp"):
+        raise ValueError("Invalid latent folder: {}".format(folder))
+    rel = path.replace("\\", "/").lstrip("/")
+    return "{} [{}]".format(rel, folder)
+
+
 class LoadLatent:
     SEARCH_ALIASES = ["import latent", "open latent"]
 
     @classmethod
     def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
-        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f)) and f.endswith(".latent")]
-        return {"required": {"latent": [sorted(files), ]}, }
+        return {"required": {
+            "latent": (_list_latent_combo_files(), {
+                "tooltip": "Latent files from input/, output/, and temp/ (including subfolders such as latents/). Output files are tagged [output].",
+            }),
+        }}
 
     CATEGORY = "model/latent"
 
@@ -579,22 +634,7 @@ class LoadLatent:
     FUNCTION = "load"
 
     def load(self, latent):
-        latent_path = folder_paths.get_annotated_filepath(latent)
-        latent = safetensors.torch.load_file(latent_path, device="cpu")
-        multiplier = 1.0
-        if "latent_format_version_0" not in latent:
-            multiplier = 1.0 / 0.18215
-        first = latent["latent_tensor"].float() * multiplier
-        extras = []
-        i = 1
-        while "latent_nested_{}".format(i) in latent:
-            extras.append(latent["latent_nested_{}".format(i)].float() * multiplier)
-            i += 1
-        if extras:
-            samples = {"samples": comfy.nested_tensor.NestedTensor([first] + extras)}
-        else:
-            samples = {"samples": first}
-        return (samples, )
+        return (_samples_from_latent_file(folder_paths.get_annotated_filepath(latent)), )
 
     @classmethod
     def IS_CHANGED(s, latent):
@@ -606,9 +646,44 @@ class LoadLatent:
 
     @classmethod
     def VALIDATE_INPUTS(s, latent):
-        if not folder_paths.exists_annotated_filepath(latent):
-            return "Invalid latent file: {}".format(latent)
-        return True
+        return _validate_latent_combo(latent)
+
+
+class LoadLatentPath:
+    SEARCH_ALIASES = ["latent path", "load latent file", "open latent path"]
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "folder": (["input", "output", "temp"], {"default": "output"}),
+            "path": ("STRING", {
+                "default": "latents/ComfyUI_00001_.latent",
+                "tooltip": "Path relative to the selected folder. Save Latent writes to output/latents/ by default.",
+            }),
+        }}
+
+    CATEGORY = "model/latent"
+    DESCRIPTION = "Load a .latent file from a path under input, output, or temp instead of picking from the input folder list."
+
+    RETURN_TYPES = ("LATENT", )
+    FUNCTION = "load"
+
+    def load(self, folder, path):
+        return (_samples_from_latent_file(folder_paths.get_annotated_filepath(_annotated_latent_path(folder, path))), )
+
+    @classmethod
+    def IS_CHANGED(s, folder, path):
+        image_path = folder_paths.get_annotated_filepath(_annotated_latent_path(folder, path))
+        m = hashlib.sha256()
+        with open(image_path, 'rb') as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, folder, path):
+        if folder not in ("input", "output", "temp"):
+            return "Invalid latent folder: {}".format(folder)
+        return _validate_latent_combo(_annotated_latent_path(folder, path))
 
 
 class CheckpointLoader:
@@ -2142,6 +2217,7 @@ NODE_CLASS_MAPPINGS = {
     "DiffusersLoader": DiffusersLoader,
 
     "LoadLatent": LoadLatent,
+    "LoadLatentPath": LoadLatentPath,
     "SaveLatent": SaveLatent,
 
     "ConditioningZeroOut": ConditioningZeroOut,
@@ -2189,6 +2265,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ConditioningZeroOut": "Conditioning Zero Out",
     # Latent
     "LoadLatent": "Load Latent",
+    "LoadLatentPath": "Load Latent (Path)",
     "SaveLatent": "Save Latent",
     "VAEEncodeForInpaint": "VAE Encode (for Inpainting)",
     "SetLatentNoiseMask": "Set Latent Noise Mask",

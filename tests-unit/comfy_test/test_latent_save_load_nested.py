@@ -41,3 +41,30 @@ def test_save_load_plain_latent_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(folder_paths, "get_annotated_filepath", lambda name, default_dir=None: path)
     loaded, = nodes.LoadLatent().load(loc["filename"])
     assert torch.equal(loaded["samples"], samples["samples"])
+
+
+def test_load_latent_path_from_output_subfolder(tmp_path, monkeypatch):
+    samples = {"samples": torch.randn(1, 4, 8, 8)}
+    saver = nodes.SaveLatent()
+    saver.output_dir = str(tmp_path)
+    out = saver.save(samples, filename_prefix="latents/ComfyUI")
+    loc = out["ui"]["latents"][0]
+    rel = "{}/{}".format(loc["subfolder"], loc["filename"]) if loc["subfolder"] else loc["filename"]
+
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    loaded, = nodes.LoadLatentPath().load("output", rel)
+    assert torch.equal(loaded["samples"], samples["samples"])
+
+
+def test_load_latent_path_rejects_escape(tmp_path, monkeypatch):
+    monkeypatch.setattr(folder_paths, "get_output_directory", lambda: str(tmp_path))
+    assert nodes.LoadLatentPath.VALIDATE_INPUTS("output", "../secret.latent") is not True
+
+
+def test_list_latent_combo_includes_output_subfolder(tmp_path, monkeypatch):
+    latent_dir = tmp_path / "latents"
+    latent_dir.mkdir()
+    (latent_dir / "clip.latent").write_bytes(b"x")
+    monkeypatch.setattr(folder_paths, "get_directory_by_type", lambda t: str(tmp_path) if t == "output" else None)
+    files = nodes._list_latent_combo_files()
+    assert "latents/clip.latent [output]" in files
