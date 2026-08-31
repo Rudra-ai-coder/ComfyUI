@@ -4,6 +4,7 @@ from typing_extensions import override
 import comfy.model_management
 import comfy.utils
 import node_helpers
+from comfy.bernini.context import make_source_ids
 from comfy_api.latest import ComfyExtension, io
 
 
@@ -58,6 +59,10 @@ class BerniniConditioning(io.ComfyNode):
                         prefix="reference_image_", min=0, max=8)),
                 io.Int.Input("ref_max_size", default=848, min=16, max=8192, step=16, optional=True, tooltip=(
                     "Max size for the long edge of reference_video and reference_images. Resized with preserved aspect ratio and snapped to 16px.")),
+                io.Int.Input("max_trained_src_id", default=5, min=1, max=20, optional=True, tooltip=(
+                    "When reference streams exceed this count, evenly interpolate source_id RoPE into [1, max_trained_src_id].")),
+                io.Boolean.Input("interpolate_src_id", default=True, optional=True, tooltip=(
+                    "Linearly map source ids into the trained range when stream count > max_trained_src_id.")),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -67,8 +72,11 @@ class BerniniConditioning(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, positive, negative, vae, width, height, length, batch_size, source_video=None, reference_video=None, reference_images=None, ref_max_size=848) -> io.NodeOutput:
-        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
+    def execute(cls, positive, negative, vae, width, height, length, batch_size,
+                source_video=None, reference_video=None, reference_images=None, ref_max_size=848,
+                max_trained_src_id=5, interpolate_src_id=True) -> io.NodeOutput:
+        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8],
+                             device=comfy.model_management.intermediate_device())
 
         # source_video (1), reference_video (2), reference_images (3, 4, ...).
         context = []
@@ -91,9 +99,22 @@ class BerniniConditioning(io.ComfyNode):
                     img = _resize_long_edge(imgs[i:i + 1], ref_max_size)  # native aspect per ref
                     context.append(vae.encode(img[:, :, :, :3]))
 
+        meta = {}
+        if source_video is not None:
+            meta["bernini_num_videos"] = 1
+
         if context:
-            positive = node_helpers.conditioning_set_values(positive, {"context_latents": context})
-            negative = node_helpers.conditioning_set_values(negative, {"context_latents": context})
+            source_ids = make_source_ids(len(context), max_trained_src_id, interpolate_src_id)
+            meta["bernini_source_ids"] = source_ids
+            positive = node_helpers.conditioning_set_values(
+                positive, {"context_latents": context, **meta}
+            )
+            negative = node_helpers.conditioning_set_values(
+                negative, {"context_latents": context, **meta}
+            )
+        elif meta:
+            positive = node_helpers.conditioning_set_values(positive, meta)
+            negative = node_helpers.conditioning_set_values(negative, meta)
 
         return io.NodeOutput(positive, negative, {"samples": latent})
 

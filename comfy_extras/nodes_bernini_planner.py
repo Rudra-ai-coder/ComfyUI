@@ -160,9 +160,21 @@ class BerniniPlannerLoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, path) -> io.NodeOutput:
-        sd = _load_split_state_dict(path)
+        resolved = path if os.path.isfile(path) else folder_paths.get_full_path("bernini", path)
+        if resolved is None:
+            resolved = folder_paths.get_full_path_or_raise("bernini", "connector.safetensors")
+        sd = load_file(resolved, device="cpu")
         connector_sd = {k.removeprefix("connector."): v for k, v in sd.items() if k.startswith("connector.")}
+        if not connector_sd:
+            connector_sd = {k: v for k, v in sd.items() if k != "mask_tokens"}
         mask = sd.get("mask_tokens")
+        if mask is None:
+            mask_path = os.path.join(os.path.dirname(resolved), "mask_tokens.safetensors")
+            if os.path.isfile(mask_path):
+                mask_sd = load_file(mask_path, device="cpu")
+                mask = mask_sd.get("mask_tokens")
+                if mask is None and len(mask_sd) == 1:
+                    mask = next(iter(mask_sd.values()))
         if mask is None:
             raise KeyError("mask_tokens not found in planner checkpoint")
 
@@ -200,6 +212,8 @@ class BerniniVitDecoderLoader(io.ComfyNode):
     def execute(cls, path) -> io.NodeOutput:
         sd = _load_split_state_dict(path)
         vit_sd = {k.removeprefix("vit_decoder."): v for k, v in sd.items() if k.startswith("vit_decoder.")}
+        if not vit_sd:
+            vit_sd = {k.removeprefix("vit_decoder."): v for k, v in sd.items()}
         # Official BerniniModel: extra_one_step=config.clip_diff_cfg.get("extra_one_step", True).
         # Config omits the key → True. Changes the FlowMatch sigma grid inside MaskGIT.
         vit_decoder = DiffLoss_FM(

@@ -1681,6 +1681,10 @@ class WAN21(BaseModel):
         if context_latents is not None:
             out['context_latents'] = comfy.conds.CONDList([self.process_latent_in(l) for l in context_latents])
 
+        bernini_source_ids = kwargs.get("bernini_source_ids", None)
+        if bernini_source_ids is not None:
+            out['bernini_source_ids'] = comfy.conds.CONDConstant(bernini_source_ids)
+
         return out
 
     def resize_cond_for_context_window(self, cond_key, cond_value, window, x_in, device, retain_index_list=[]):
