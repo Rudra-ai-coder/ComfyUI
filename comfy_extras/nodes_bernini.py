@@ -52,6 +52,7 @@ class BerniniConditioning(io.ComfyNode):
                 io.Int.Input("length", default=81, min=1, max=8192, step=4),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 io.Image.Input("source_video", optional=True, tooltip=("Source video to edit or restyle (v2v, rv2v). Resized to width/height and trimmed to length.")),
+                io.Latent.Input("latent", optional=True, tooltip="VAE-encoded start latent for the sampler. If omitted, sampling starts from empty noise. Use denoise < 1 when this is connected."),
                 io.Image.Input("reference_video", optional=True, tooltip=("Video to insert into the source video (ads2v).")),
                 io.Autogrow.Input("reference_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
@@ -73,10 +74,13 @@ class BerniniConditioning(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, negative, vae, width, height, length, batch_size,
-                source_video=None, reference_video=None, reference_images=None, ref_max_size=848,
+                source_video=None, latent=None, reference_video=None, reference_images=None, ref_max_size=848,
                 max_trained_src_id=5, interpolate_src_id=True) -> io.NodeOutput:
-        latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8],
-                             device=comfy.model_management.intermediate_device())
+        if latent is None:
+            latent = {"samples": torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8],
+                                             device=comfy.model_management.intermediate_device())}
+        else:
+            latent = latent.copy()
 
         # source_video (1), reference_video (2), reference_images (3, 4, ...).
         context = []
@@ -116,7 +120,7 @@ class BerniniConditioning(io.ComfyNode):
             positive = node_helpers.conditioning_set_values(positive, meta)
             negative = node_helpers.conditioning_set_values(negative, meta)
 
-        return io.NodeOutput(positive, negative, {"samples": latent})
+        return io.NodeOutput(positive, negative, latent)
 
 
 class BerniniExtension(ComfyExtension):
