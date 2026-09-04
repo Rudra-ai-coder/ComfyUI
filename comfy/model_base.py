@@ -1925,6 +1925,12 @@ class WAN22(WAN21):
     def scale_latent_inpaint(self, sigma, noise, latent_image, **kwargs):
         return latent_image
 
+class WAN22_CausalAR(WAN22):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super(WAN21, self).__init__(model_config, model_type, device=device,
+                                    unet_model=comfy.ldm.wan.ar_model.CausalWanModel)
+        self.image_to_video = False
+
 class Trellis2(BaseModel):
     def __init__(self, model_config, model_type=ModelType.FLOW, device=None, unet_model=comfy.ldm.trellis2.model.Trellis2):
         super().__init__(model_config, model_type, device, unet_model)

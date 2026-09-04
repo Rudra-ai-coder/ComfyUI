@@ -2591,6 +2591,7 @@ async def init_builtin_extra_nodes():
         "nodes_kandinsky5.py",
         "nodes_wanmove.py",
         "nodes_ar_video.py",
+        "nodes_dreamx.py",
         "nodes_image_compare.py",
         "nodes_zimage.py",
         "nodes_glsl.py",

@@ -1478,6 +1478,21 @@ class WAN22_T2V(WAN21_T2V):
         out = model_base.WAN22(self, image_to_video=True, device=device)
         return out
 
+class WAN22_CausalAR_T2V(WAN22_T2V):
+    unet_config = {
+        "image_model": "wan2.1",
+        "model_type": "t2v",
+        "out_dim": 48,
+        "causal_ar": True,
+    }
+
+    def __init__(self, unet_config):
+        super().__init__(unet_config)
+        self.unet_config.pop("causal_ar", None)
+
+    def get_model(self, state_dict, prefix="", device=None):
+        return model_base.WAN22_CausalAR(self, device=device)
+
 class Trellis2(supported_models_base.BASE):
     unet_config = {
         "image_model": "trellis2"
@@ -2515,6 +2530,7 @@ models = [
     PiD,
     PixelDiTT2I,
     Lumina2,
+    WAN22_CausalAR_T2V,
     WAN22_T2V,
     WAN21_CausalAR_T2V,
     WAN21_T2V,

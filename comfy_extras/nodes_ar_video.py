@@ -61,14 +61,21 @@ class SamplerARVideo(io.ComfyNode):
                     tooltip="Frames per autoregressive block. 1 = framewise, "
                             "3 = chunkwise. Must match the checkpoint's training mode.",
                 ),
+                io.Int.Input(
+                    "kv_len",
+                    default=0, min=0, max=1024,
+                    tooltip="Max latent frames kept in the KV cache. 0 keeps the full history. "
+                            "DreamX 2K refiner uses 9.",
+                ),
             ],
             outputs=[io.Sampler.Output()],
         )
 
     @classmethod
-    def execute(cls, num_frame_per_block) -> io.NodeOutput:
+    def execute(cls, num_frame_per_block, kv_len=0) -> io.NodeOutput:
         extra_options = {
             "num_frame_per_block": num_frame_per_block,
+            "kv_len": kv_len,
         }
         return io.NodeOutput(comfy.samplers.ksampler("ar_video", extra_options))
 

@@ -1909,9 +1909,22 @@ def sample_sa_solver_pece(model, x, sigmas, extra_args=None, callback=None, disa
     return sample_sa_solver(model, x, sigmas, extra_args=extra_args, callback=callback, disable=disable, tau_func=tau_func, s_noise=s_noise, noise_sampler=noise_sampler, predictor_order=predictor_order, corrector_order=corrector_order, use_pece=True, simple_order_2=simple_order_2)
 
 
+def _truncate_ar_kv_caches(kv_caches, max_tokens):
+    if max_tokens <= 0:
+        return
+    for cache in kv_caches:
+        end = cache["end"]
+        if end <= max_tokens:
+            continue
+        start = end - max_tokens
+        cache["k"][:, :max_tokens] = cache["k"][:, start:end].clone()
+        cache["v"][:, :max_tokens] = cache["v"][:, start:end].clone()
+        cache["end"] = max_tokens
+
+
 @torch.no_grad()
 def sample_ar_video(model, x, sigmas, extra_args=None, callback=None, disable=None,
-                    num_frame_per_block=1):
+                    num_frame_per_block=1, kv_len=0):
     """
     Autoregressive video sampler: block-by-block denoising with KV cache
     and flow-match re-noising for Causal Forcing / Self-Forcing models.
@@ -2017,6 +2030,8 @@ def sample_ar_video(model, x, sigmas, extra_args=None, callback=None, disable=No
                 cache["end"] -= bf * frame_seq_len
             zero_sigma = sigmas.new_zeros([1])
             _ = model(noisy_input, zero_sigma * s_in, **extra_args)
+            if kv_len > 0:
+                _truncate_ar_kv_caches(kv_caches, kv_len * frame_seq_len)
 
             current_start_frame += bf
     finally:
