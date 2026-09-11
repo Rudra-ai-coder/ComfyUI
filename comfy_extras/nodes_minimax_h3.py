@@ -90,6 +90,62 @@ def _empty_av_latent(width, height, length, batch_size=1):
     return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}, frame_count
 
 
+def _pixel_frames_from_latent_t(latent_t):
+    return sum(FRAME_PER_TOKEN[k % 5] for k in range(int(latent_t)))
+
+
+def _h3_av_tensors(samples, name):
+    if not getattr(samples, "is_nested", False) or len(samples.tensors) != 2:
+        raise ValueError("{} expects a MiniMax H3 AV NestedTensor latent".format(name))
+    video, audio = samples.unbind()
+    if video.ndim != 5 or video.shape[1] != 24 or audio.ndim != 4 or audio.shape[1] != 32:
+        raise ValueError("{} expects a MiniMax H3 AV NestedTensor latent".format(name))
+    return video, audio
+
+
+def _tail_context(video, audio, context_frames):
+    if context_frames <= 0:
+        return video, audio
+    ctx_frames = _pixel_frames_from_latent_t(video.shape[2])
+    keep = min(int(context_frames), ctx_frames)
+    while keep >= 5 and keep % 17 != 5:
+        keep -= 1
+    if keep < 5:
+        raise ValueError("context_frames needs at least 5 frames on the 17k+5 grid")
+    if keep >= ctx_frames:
+        return video, audio
+    keep_t = min(video_latent_t(keep), video.shape[2])
+    keep_a = min(temporal_shape(keep)[2], audio.shape[-1])
+    return video[:, :, -keep_t:].clone(), audio[..., -keep_a:].clone()
+
+
+def _fit_time(tensor, dim, size):
+    cur = tensor.shape[dim]
+    if cur == size:
+        return tensor
+    if cur > size:
+        sl = [slice(None)] * tensor.ndim
+        sl[dim] = slice(0, size)
+        return tensor[tuple(sl)].clone()
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = size - cur
+    return torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=dim)
+
+
+def _shift_h3_keyframes(positive, frame_shift):
+    if not positive or frame_shift == 0:
+        return positive
+    keyframes = positive[0][1].get("minimax_keyframes")
+    if not keyframes:
+        return positive
+    shifted = []
+    for kf in keyframes:
+        item = dict(kf)
+        item["resolved_frame_index"] = int(item.get("resolved_frame_index", 0)) + frame_shift
+        shifted.append(item)
+    return node_helpers.conditioning_set_values(positive, {"minimax_keyframes": shifted})
+
+
 class EmptyMiniMaxH3LatentAV(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -110,6 +166,77 @@ class EmptyMiniMaxH3LatentAV(io.ComfyNode):
     def execute(cls, width, height, length) -> io.NodeOutput:
         latent, _ = _empty_av_latent(width, height, length)
         return io.NodeOutput(latent)
+
+
+class MiniMaxH3ContinueAV(io.ComfyNode):
+    """Prefix a frozen AV latent and denoise only the continuation."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3ContinueAV",
+            display_name="MiniMax H3 Continue AV",
+            search_aliases=["minimax continue", "h3 extend", "frozen prefix", "context continuation"],
+            category="model/latent/minimax",
+            description="Freeze an encoded MiniMax H3 video+audio latent at the start of a new clip and denoise only the remaining duration. Existing t2va / fl2va / ref2va graphs are unchanged: encode the previous clip, pass it as context, and sample with denoise=1.",
+            inputs=[
+                io.Latent.Input("context", tooltip="Frozen MiniMax H3 AV latent (Encode AV or a previous sample). Not denoised."),
+                io.Int.Input("length", default=124, min=5, max=3600, step=17,
+                    tooltip="New frames to generate at 24 fps when latent is not connected. Snapped so the combined clip lands on the 17k+5 grid."),
+                io.Int.Input("context_frames", default=0, min=0, max=3600, step=1,
+                    tooltip="Pixel frames of context to keep, taken from the end (0 = all). Snapped down to the 17k+5 grid."),
+                io.Latent.Input("latent", optional=True,
+                    tooltip="Optional continuation AV latent to denoise (Empty or Image to Video output). Spatial size must match context. If omitted, an empty latent of length is used."),
+                io.Conditioning.Input("positive", optional=True,
+                    tooltip="Optional conditioning from Image to Video / Add Guide. Keyframe frame indices are shifted by the frozen prefix so they still land on the generated region."),
+            ],
+            outputs=[
+                io.Latent.Output(),
+                io.Conditioning.Output(display_name="positive"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, context, length, context_frames=0, latent=None, positive=None) -> io.NodeOutput:
+        video, audio = _h3_av_tensors(context["samples"], "MiniMax H3 Continue AV")
+        video, audio = _tail_context(video, audio, context_frames)
+
+        if latent is not None:
+            extra_v, extra_a = _h3_av_tensors(latent["samples"], "MiniMax H3 Continue AV")
+        else:
+            extra, _ = _empty_av_latent(video.shape[4] * 16, video.shape[3] * 16, length,
+                                        batch_size=video.shape[0])
+            extra_v, extra_a = extra["samples"].unbind()
+
+        if extra_v.shape[0] != video.shape[0] or extra_v.shape[-2:] != video.shape[-2:]:
+            raise ValueError("continuation latent batch and spatial size must match the frozen context")
+        extra_v = extra_v.to(device=video.device, dtype=video.dtype)
+        extra_a = extra_a.to(device=audio.device, dtype=audio.dtype)
+
+        ctx_t, ctx_a = video.shape[2], audio.shape[-1]
+        ctx_frames = _pixel_frames_from_latent_t(ctx_t)
+        extra_frames = _pixel_frames_from_latent_t(extra_v.shape[2])
+        _, total_t, total_a = temporal_shape(ctx_frames + extra_frames)
+        extra_t = total_t - ctx_t
+        extra_a_len = total_a - ctx_a
+        if extra_t < 1 or extra_a_len < 1:
+            raise ValueError("continuation is empty after snapping to the H3 frame grid")
+
+        extra_v = _fit_time(extra_v, 2, extra_t)
+        extra_a = _fit_time(extra_a, -1, extra_a_len)
+        video_out = torch.cat([video, extra_v], dim=2)
+        audio_out = torch.cat([audio, extra_a], dim=-1)
+
+        v_mask = torch.ones([video_out.shape[0], 1, video_out.shape[2], video_out.shape[3], video_out.shape[4]],
+                            dtype=torch.float32, device=video_out.device)
+        v_mask[:, :, :ctx_t] = 0
+        a_mask = torch.ones([audio_out.shape[0], 1, audio_out.shape[2], audio_out.shape[-1]],
+                            dtype=torch.float32, device=audio_out.device)
+        a_mask[..., :ctx_a] = 0
+
+        out = {"samples": comfy.nested_tensor.NestedTensor((video_out, audio_out)),
+               "noise_mask": comfy.nested_tensor.NestedTensor((v_mask, a_mask))}
+        return io.NodeOutput(out, _shift_h3_keyframes(positive, ctx_frames))
 
 
 class MiniMaxH3ImageToVideo(io.ComfyNode):
@@ -619,6 +746,7 @@ class MiniMaxH3Extension(ComfyExtension):
     async def get_node_list(self):
         return [
             EmptyMiniMaxH3LatentAV,
+            MiniMaxH3ContinueAV,
             MiniMaxH3ImageToVideo,
             MiniMaxH3AddGuide,
             MiniMaxH3ReferenceToVideo,
