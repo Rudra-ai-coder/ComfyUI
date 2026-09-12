@@ -3,6 +3,7 @@ import torch
 import comfy.nested_tensor
 from comfy_extras.nodes_minimax_h3 import (
     MiniMaxH3ContinueAV,
+    MiniMaxH3TrimFrozenAV,
     _empty_av_latent,
     _pixel_frames_from_latent_t,
     temporal_shape,
@@ -36,6 +37,32 @@ def test_continue_freezes_prefix_and_snaps_total_grid():
     assert torch.count_nonzero(a_mask[..., :context["samples"].unbind()[1].shape[-1]]) == 0
     ctx_v = context["samples"].unbind()[0]
     torch.testing.assert_close(video[:, :, :ctx_t], ctx_v)
+    assert out["h3_frozen_video_t"] == ctx_t
+    assert out["h3_frozen_audio_t"] == context["samples"].unbind()[1].shape[-1]
+
+
+def test_trim_frozen_drops_prefix():
+    context, ctx_frames = _context(22)
+    continued, _ = MiniMaxH3ContinueAV.execute(context, 22).result
+    ctx_t = video_latent_t(ctx_frames)
+    ctx_a = context["samples"].unbind()[1].shape[-1]
+    full_v, full_a = continued["samples"].unbind()
+    trimmed = MiniMaxH3TrimFrozenAV.execute(continued).result[0]
+    video, audio = trimmed["samples"].unbind()
+    torch.testing.assert_close(video, full_v[:, :, ctx_t:])
+    torch.testing.assert_close(audio, full_a[..., ctx_a:])
+    assert "noise_mask" not in trimmed
+    assert "h3_frozen_video_t" not in trimmed
+
+
+def test_trim_frozen_uses_context_when_metadata_missing():
+    context, ctx_frames = _context(22)
+    continued, _ = MiniMaxH3ContinueAV.execute(context, 22).result
+    continued.pop("h3_frozen_video_t")
+    continued.pop("h3_frozen_audio_t")
+    ctx_t = video_latent_t(ctx_frames)
+    trimmed = MiniMaxH3TrimFrozenAV.execute(continued, context=context).result[0]
+    assert trimmed["samples"].unbind()[0].shape[2] == continued["samples"].unbind()[0].shape[2] - ctx_t
 
 
 def test_continue_uses_optional_remaining_latent():

@@ -9,12 +9,16 @@ sampling runs on the flat pack with any stock sampler (the model handles the
 audio stream's shifted schedule internally).
 """
 
+import hashlib
+import json
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 import torchaudio
 
+import folder_paths
 import nodes
 import comfy.model_management
 import comfy.model_prefetch
@@ -23,8 +27,10 @@ import comfy.nested_tensor
 import comfy.patcher_extension
 import comfy.utils
 import node_helpers
+from comfy.cli_args import args
 from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import ComfyExtension, io, ui
+from comfy_extras.nodes_cond import pack_conditioning, unpack_conditioning
 
 CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
@@ -235,8 +241,192 @@ class MiniMaxH3ContinueAV(io.ComfyNode):
         a_mask[..., :ctx_a] = 0
 
         out = {"samples": comfy.nested_tensor.NestedTensor((video_out, audio_out)),
-               "noise_mask": comfy.nested_tensor.NestedTensor((v_mask, a_mask))}
+               "noise_mask": comfy.nested_tensor.NestedTensor((v_mask, a_mask)),
+               "h3_frozen_video_t": ctx_t,
+               "h3_frozen_audio_t": ctx_a}
         return io.NodeOutput(out, _shift_h3_keyframes(positive, ctx_frames))
+
+
+class MiniMaxH3TrimFrozenAV(io.ComfyNode):
+    """Drop the frozen Continue AV prefix so the latent is only the generated suffix."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3TrimFrozenAV",
+            display_name="MiniMax H3 Trim Frozen AV",
+            search_aliases=["minimax trim", "h3 drop context", "remove frozen prefix"],
+            category="model/latent/minimax",
+            description="Remove the frozen context prefix from a MiniMax H3 Continue AV latent, leaving only the generated continuation.",
+            inputs=[
+                io.Latent.Input("samples", tooltip="Sampled Continue AV latent (keeps h3_frozen_* sizes through KSampler)."),
+                io.Latent.Input("context", optional=True,
+                    tooltip="Frozen context latent, used only when the continue metadata is missing."),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, context=None) -> io.NodeOutput:
+        video, audio = _h3_av_tensors(samples["samples"], "MiniMax H3 Trim Frozen AV")
+        ctx_t = samples.get("h3_frozen_video_t")
+        ctx_a = samples.get("h3_frozen_audio_t")
+        if ctx_t is None or ctx_a is None:
+            if context is None:
+                raise ValueError("MiniMax H3 Trim Frozen AV needs Continue AV metadata or a context latent")
+            ctx_v, ctx_a_t = _h3_av_tensors(context["samples"], "MiniMax H3 Trim Frozen AV")
+            ctx_t, ctx_a = ctx_v.shape[2], ctx_a_t.shape[-1]
+        ctx_t, ctx_a = int(ctx_t), int(ctx_a)
+        if ctx_t < 1 or ctx_a < 1 or ctx_t >= video.shape[2] or ctx_a >= audio.shape[-1]:
+            raise ValueError("frozen prefix does not fit in the AV latent")
+        out = samples.copy()
+        out["samples"] = comfy.nested_tensor.NestedTensor(
+            (video[:, :, ctx_t:].clone(), audio[..., ctx_a:].clone()))
+        out.pop("noise_mask", None)
+        out.pop("h3_frozen_video_t", None)
+        out.pop("h3_frozen_audio_t", None)
+        return io.NodeOutput(out)
+
+
+H3_CACHE_EXT = ".h3cache"
+
+
+def pack_h3_cache(positive, latent):
+    payload = {}
+    if positive is not None:
+        payload["positive"] = positive
+    if latent is not None:
+        payload["latent"] = latent
+    if not payload:
+        raise ValueError("MiniMax H3 Cache needs conditioning or a latent")
+    return pack_conditioning([[None, payload]])
+
+
+def unpack_h3_cache(tensors, schema):
+    extra = unpack_conditioning(tensors, schema)[0][1]
+    return extra.get("positive"), extra.get("latent")
+
+
+def _list_h3_cache_files():
+    files = []
+    for folder, tag in (("input", None), ("output", "output"), ("temp", "temp")):
+        base = folder_paths.get_directory_by_type(folder)
+        if not base or not os.path.isdir(base):
+            continue
+        for root, dirnames, filenames in os.walk(base, followlinks=True):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith(".") or not fn.endswith(H3_CACHE_EXT):
+                    continue
+                full = os.path.abspath(os.path.join(root, fn))
+                if not folder_paths.is_within_directory(base, full):
+                    continue
+                rel = os.path.relpath(full, base).replace(os.sep, "/")
+                files.append("{} [{}]".format(rel, tag) if tag else rel)
+    return sorted(files)
+
+
+def _validate_h3_cache_combo(cache):
+    if not isinstance(cache, str):
+        return "Invalid MiniMax H3 cache file: {}".format(cache)
+    name, _ = folder_paths.annotated_filepath(cache)
+    if not name.endswith(H3_CACHE_EXT):
+        return "Invalid MiniMax H3 cache file: {}".format(cache)
+    if not folder_paths.exists_annotated_filepath(cache):
+        return "Invalid MiniMax H3 cache file: {}".format(cache)
+    return True
+
+
+class MiniMaxH3SaveCache(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SaveCache",
+            display_name="Save MiniMax H3 Cache",
+            search_aliases=["minimax cache", "save i2v", "save ref2va"],
+            category="model/conditioning/minimax",
+            description="Save MiniMax H3 Image to Video or Reference to Video conditioning and/or the AV latent to one file. Connect only what you want stored. Copy the file into input/ or load it from output/.",
+            inputs=[
+                io.Conditioning.Input("positive", optional=True,
+                    tooltip="Image to Video or Reference to Video conditioning (prompt embeddings, keyframes, refs)."),
+                io.Latent.Input("latent", optional=True,
+                    tooltip="Optional MiniMax H3 AV latent to store with the conditioning."),
+                io.String.Input("filename_prefix", default="h3cache/ComfyUI"),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Latent.Output(),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def check_lazy_status(cls, **kwargs):
+        return []
+
+    @classmethod
+    def execute(cls, filename_prefix="h3cache/ComfyUI", positive=None, latent=None) -> io.NodeOutput:
+        tensors, schema = pack_h3_cache(positive, latent)
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, folder_paths.get_output_directory())
+        file = "{}_{:05}_.h3cache".format(filename, counter)
+        metadata = {"minimax_h3_cache": json.dumps(schema)}
+        if not args.disable_metadata:
+            if cls.hidden.prompt is not None:
+                metadata["prompt"] = json.dumps(cls.hidden.prompt)
+            if cls.hidden.extra_pnginfo is not None:
+                for x in cls.hidden.extra_pnginfo:
+                    metadata[x] = json.dumps(cls.hidden.extra_pnginfo[x])
+        comfy.utils.save_torch_file(tensors, os.path.join(full_output_folder, file), metadata=metadata)
+        return io.NodeOutput(
+            positive, latent,
+            ui={"files": [ui.SavedResult(file, subfolder, io.FolderType.output)]},
+        )
+
+
+class MiniMaxH3LoadCache(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3LoadCache",
+            display_name="Load MiniMax H3 Cache",
+            search_aliases=["minimax cache", "load i2v", "load ref2va"],
+            category="model/conditioning/minimax",
+            description="Load a MiniMax H3 cache saved by Save MiniMax H3 Cache. Files in input/, output/, and temp/ are listed. Use only the outputs that were saved.",
+            inputs=[
+                io.Combo.Input("cache", options=_list_h3_cache_files(),
+                    tooltip="Cache files from input/, output/, and temp/. Output files are tagged [output]."),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Latent.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, cache) -> io.NodeOutput:
+        err = _validate_h3_cache_combo(cache)
+        if err is not True:
+            raise ValueError(err)
+        path = folder_paths.get_annotated_filepath(cache)
+        tensors, metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+        if metadata is None or "minimax_h3_cache" not in metadata:
+            raise ValueError("Not a MiniMax H3 cache file: {}".format(cache))
+        schema = json.loads(metadata["minimax_h3_cache"])
+        return io.NodeOutput(*unpack_h3_cache(tensors, schema))
+
+    @classmethod
+    def fingerprint_inputs(cls, cache):
+        path = folder_paths.get_annotated_filepath(cache)
+        m = hashlib.sha256()
+        with open(path, "rb") as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def validate_inputs(cls, cache):
+        return _validate_h3_cache_combo(cache)
 
 
 class MiniMaxH3ImageToVideo(io.ComfyNode):
@@ -747,6 +937,9 @@ class MiniMaxH3Extension(ComfyExtension):
         return [
             EmptyMiniMaxH3LatentAV,
             MiniMaxH3ContinueAV,
+            MiniMaxH3TrimFrozenAV,
+            MiniMaxH3SaveCache,
+            MiniMaxH3LoadCache,
             MiniMaxH3ImageToVideo,
             MiniMaxH3AddGuide,
             MiniMaxH3ReferenceToVideo,
