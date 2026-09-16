@@ -5,6 +5,9 @@ SVD of (fine_tune - base) on matching 2D weights. Load with the normal
 Load LoRA node on the *base* MiniMax H3 model.
 
 Both files must be the same architecture (same PDD head count, hidden size).
+Uses GPU randomized SVD one layer at a time (fits 24 GB if ComfyUI is closed).
+Falls back to CPU only if a layer OOMs.
+
 Run from the ComfyUI repo root:
 
   python tools/extract_minimax_h3_lora.py \\
@@ -29,7 +32,8 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 import comfy.utils
-from comfy_extras.nodes_lora_extract import extract_lora
+
+CLAMP_QUANTILE = 0.99
 
 PREFIXES = ("diffusion_model.", "model.diffusion_model.", "model.")
 SKIP_SUFFIXES = (
@@ -63,6 +67,28 @@ def is_weight(key):
 
 def is_bias(key):
     return key.endswith(".bias")
+
+
+def extract_lora_lowmem(diff, rank):
+    # Randomized SVD of the 2D delta only; full torch.linalg.svd of H3 FFN/QKV
+    # layers will not fit in 24 GB.
+    out_dim, in_dim = diff.shape[0], diff.shape[1]
+    rank = min(rank, in_dim, out_dim)
+    q = min(rank + 8, min(out_dim, in_dim))
+    u, s, v = torch.svd_lowrank(diff.float(), q=q, niter=2)
+    u = u[:, :rank] * s[:rank].unsqueeze(0)
+    vh = v[:, :rank].transpose(0, 1).contiguous()
+    dist = torch.cat([u.reshape(-1), vh.reshape(-1)])
+    hi_val = torch.quantile(dist, CLAMP_QUANTILE)
+    return u.clamp(-hi_val, hi_val), vh.clamp(-hi_val, hi_val)
+
+
+def factor_delta(diff, rank):
+    try:
+        return extract_lora_lowmem(diff, rank)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return extract_lora_lowmem(diff.cpu(), rank)
 
 
 class WeightStore:
@@ -104,29 +130,34 @@ def extract_pair(base_get, ft_get, shared, rank, min_diff, bias, device):
             continue
         bw = base_get(bare, device)
         fw = ft_get(bare, device)
-        if tuple(bw.shape) != tuple(fw.shape):
-            skipped.append((bare, tuple(bw.shape), tuple(fw.shape)))
-            continue
-        diff = fw - bw
-        if float(diff.abs().max()) < min_diff:
-            continue
-        if is_weight(bare):
-            module = "diffusion_model.{}".format(bare[:-len(".weight")])
-        else:
-            module = "diffusion_model.{}".format(bare[:-len(".bias")])
-        if is_bias(bare) or diff.ndim < 2:
-            key = "{}.diff_b".format(module) if is_bias(bare) else "{}.diff".format(module)
-            out[key] = diff.contiguous().half().cpu()
-            continue
-        used_rank = min(rank, diff.shape[0], diff.shape[1])
         try:
-            up, down = extract_lora(diff, used_rank)
-        except Exception:
-            skipped.append((bare, tuple(bw.shape), "svd_failed"))
-            continue
-        out["{}.lora_up.weight".format(module)] = up.contiguous().half().cpu()
-        out["{}.lora_down.weight".format(module)] = down.contiguous().half().cpu()
-        out["{}.alpha".format(module)] = torch.tensor(float(used_rank), dtype=torch.float16)
+            if tuple(bw.shape) != tuple(fw.shape):
+                skipped.append((bare, tuple(bw.shape), tuple(fw.shape)))
+                continue
+            diff = fw - bw
+            if float(diff.abs().max()) < min_diff:
+                continue
+            if is_weight(bare):
+                module = "diffusion_model.{}".format(bare[:-len(".weight")])
+            else:
+                module = "diffusion_model.{}".format(bare[:-len(".bias")])
+            if is_bias(bare) or diff.ndim < 2:
+                key = "{}.diff_b".format(module) if is_bias(bare) else "{}.diff".format(module)
+                out[key] = diff.contiguous().half().cpu()
+                continue
+            used_rank = min(rank, diff.shape[0], diff.shape[1])
+            try:
+                up, down = factor_delta(diff, used_rank)
+            except Exception:
+                skipped.append((bare, tuple(bw.shape), "svd_failed"))
+                continue
+            out["{}.lora_up.weight".format(module)] = up.contiguous().half().cpu()
+            out["{}.lora_down.weight".format(module)] = down.contiguous().half().cpu()
+            out["{}.alpha".format(module)] = torch.tensor(float(used_rank), dtype=torch.float16)
+        finally:
+            del bw, fw
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     return out, skipped
 
 
@@ -167,7 +198,8 @@ def main():
     p.add_argument("--rank", type=int, default=64)
     p.add_argument("--min-diff", type=float, default=1e-6, help="Skip tensors whose max abs delta is below this")
     p.add_argument("--bias", action="store_true", help="Also store bias deltas as .diff_b")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                   help="cuda (default when available; one-layer SVD fits 24 GB) or cpu")
     args = p.parse_args()
 
     out, skipped, only_ft = extract_files(
