@@ -59,3 +59,25 @@ def test_forward_scales_audio_velocity_before_carry_conversion():
 
     expected = -3.0 * audio_src * carry + (1.0 + 3.0 * sigma_a) * audio_output * audio_mask
     torch.testing.assert_close(out[1], expected)
+
+
+def _rope_stub():
+    model = MiniMaxH3Model.__new__(MiniMaxH3Model)
+    model.rope = nn.Module()
+    model.rope.register_buffer("inv_freq", torch.ones(16, dtype=torch.float32))
+    return model
+
+
+def test_rope_freqs_spatial_scale_only_visual_hw():
+    model = _rope_stub()
+    pos = torch.tensor([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]], dtype=torch.float64)
+    base = model.rope_freqs(pos, "cpu")
+    scaled = model.rope_freqs(pos, "cpu", spatial_scale=0.5, spatial_idx=torch.tensor([0]))
+
+    t, h, w = 16, 32, 48
+    torch.testing.assert_close(scaled[0, :t], base[0, :t])
+    torch.testing.assert_close(scaled[0, t:h], base[0, t:h] * 0.5)
+    torch.testing.assert_close(scaled[0, h:w], base[0, h:w] * 0.5)
+    torch.testing.assert_close(scaled[0, w:], scaled[0, :w])
+    torch.testing.assert_close(scaled[1], base[1])
+    torch.testing.assert_close(model.rope_freqs(pos, "cpu"), base)

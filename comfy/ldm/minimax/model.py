@@ -520,9 +520,17 @@ class MiniMaxH3Model(nn.Module):
             return text_states
         return self.token_refiner(self.condition_proj(text_states[0])).unsqueeze(0)
 
-    def rope_freqs(self, position_ids, device):
+    def rope_freqs(self, position_ids, device, spatial_scale=1.0, spatial_idx=None):
         # [S, 3] float64 -> [S, 96] fp32
         pos = position_ids.to(torch.float32).to(device)
+        if spatial_scale != 1.0:
+            pos = pos.clone()
+            hw = pos[:, 1:] * spatial_scale
+            if spatial_idx is None:
+                pos[:, 1:] = hw
+            else:
+                idx = spatial_idx.to(device=device, dtype=torch.long)
+                pos[idx, 1:] = hw[idx]
         inv = comfy.model_management.cast_to(self.rope.inv_freq, device=device)
         per_axis = pos.unsqueeze(-1) * inv.view(1, 1, -1)      # [S, 3, 16]
         t_f, h_f, w_f = per_axis.unbind(dim=1)
@@ -743,7 +751,16 @@ class MiniMaxH3Model(nn.Module):
             t_emb = self.time_embedder(t_vals).to(dtype)
 
         # rotation table computed once per forward, consumed by the kitchen split-half rope
-        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
+        spatial_scale = float(transformer_options.get("minimax_h3_rope_spatial_scale", 1.0))
+        if spatial_scale != 1.0:
+            sigma_start = transformer_options.get("minimax_h3_rope_sigma_start")
+            sigma_end = transformer_options.get("minimax_h3_rope_sigma_end")
+            if sigma_start is not None and sigma_end is not None:
+                sv = float(sigma_v)
+                if not (float(sigma_end) <= sv <= float(sigma_start)):
+                    spatial_scale = 1.0
+        rope_freqs = rope_rotation_table(
+            self.rope_freqs(layout.position_ids, device, spatial_scale, layout.img_pos), dtype)
 
         # blocks
         patches_replace = transformer_options.get("patches_replace", {})

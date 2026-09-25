@@ -724,6 +724,46 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+class MiniMaxH3RoPESpatialScale(io.ComfyNode):
+    """Training-free spatial RoPE frequency scale for early denoising.
+
+    λ < 1 slows height/width RoPE decay so motion planning can consider more
+    candidate regions before locking a trajectory (arXiv:2609.23658). Temporal
+    RoPE and audio/text rows are left unchanged. Default is the paper's
+    training-free recipe: λ = 0.75 on the first 10% of the sigma schedule.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3RoPESpatialScale",
+            description="Scale MiniMax H3 spatial RoPE frequencies during early denoising.",
+            display_name="MiniMax H3 RoPE Spatial Scale",
+            search_aliases=["rope fix", "rope scale", "minimax rope", "physics rope"],
+            category="model/patch/minimax",
+            inputs=[
+                io.Model.Input("model"),
+                io.Float.Input("spatial_scale", default=0.75, min=0.0, max=2.0, step=0.01,
+                               tooltip="λ on height/width RoPE. 1.0 is unmodified; 0.75 is the paper default."),
+                io.Float.Input("start_percent", default=0.0, min=0.0, max=1.0, step=0.001,
+                               tooltip="Schedule percent where the scale starts (0 = first step)."),
+                io.Float.Input("end_percent", default=0.1, min=0.0, max=1.0, step=0.001,
+                               tooltip="Schedule percent where the scale stops. Paper uses the first 10%."),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, spatial_scale, start_percent, end_percent) -> io.NodeOutput:
+        m = model.clone()
+        model_sampling = m.get_model_object("model_sampling")
+        to = m.model_options["transformer_options"] = m.model_options.get("transformer_options", {}).copy()
+        to["minimax_h3_rope_spatial_scale"] = float(spatial_scale)
+        to["minimax_h3_rope_sigma_start"] = float(model_sampling.percent_to_sigma(start_percent))
+        to["minimax_h3_rope_sigma_end"] = float(model_sampling.percent_to_sigma(end_percent))
+        return io.NodeOutput(m)
+
+
 class MiniMaxH3FunControlPatch:
     def __init__(self, model_patch, vae, control_video, mask, source_video, strength, sigma_start, sigma_end):
         self.model_patch = model_patch
@@ -944,6 +984,7 @@ class MiniMaxH3Extension(ComfyExtension):
             MiniMaxH3AddGuide,
             MiniMaxH3ReferenceToVideo,
             MiniMaxH3SigmaShift,
+            MiniMaxH3RoPESpatialScale,
             MiniMaxH3FunControlNetApply,
             ]
 
