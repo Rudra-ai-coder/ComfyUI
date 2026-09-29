@@ -3,6 +3,7 @@
 Official H3-Regenerate-2K is not open-sourced. These nodes approximate it:
 - Encode AV: IMAGE frames + AUDIO -> NestedTensor AV latent
 - Upscale Latent: spatially upscale a previous AV NestedTensor for a low-sigma refine
+- Downscale Latent: spatially downscale a previous AV NestedTensor (audio unchanged)
 - Regenerate: decode the previous sample, attach as Ref2VA <Audio 1>/<Video 1>,
   and prepare a target-resolution latent (upscaled or empty)
 
@@ -218,6 +219,48 @@ class MiniMaxH3UpscaleLatent(io.ComfyNode):
         return io.NodeOutput(out)
 
 
+class MiniMaxH3DownscaleLatent(io.ComfyNode):
+    """Spatially downscale an H3 AV latent. Time and audio stay put."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3DownscaleLatent",
+            display_name="MiniMax H3 Downscale Latent",
+            search_aliases=["minimax downscale", "h3 latent downscale", "minimax smaller latent"],
+            category="model/latent/minimax",
+            description="Spatially downscale a MiniMax H3 AV latent. Audio length and video time are unchanged.",
+            inputs=[
+                io.Latent.Input("samples", tooltip="H3 AV NestedTensor latent (video + audio)"),
+                io.Float.Input("scale_by", default=0.5, min=0.125, max=1.0, step=0.125,
+                    tooltip="Spatial scale when width/height are 0 (0.5 = half pixel size). Rounded to a ×32 canvas."),
+                io.Int.Input("width", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
+                    tooltip="Target pixel width (0 = use scale_by). Rounded to a multiple of 32."),
+                io.Int.Input("height", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
+                    tooltip="Target pixel height (0 = use scale_by). Rounded to a multiple of 32."),
+                io.Combo.Input("downscale_method", options=["area", "bilinear", "bicubic", "nearest-exact", "bislerp"],
+                    default="area"),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, scale_by, width, height, downscale_method) -> io.NodeOutput:
+        video, audio = h3._h3_av_tensors(samples["samples"], "MiniMax H3 Downscale Latent")
+        tw, th = _target_pixel_size(video.shape[-2], video.shape[-1], scale_by, width, height)
+        video_down = comfy.utils.common_upscale(video, tw // 16, th // 16, downscale_method, "disabled")
+        out = samples.copy()
+        out["samples"] = comfy.nested_tensor.NestedTensor((video_down, audio))
+        nm = out.get("noise_mask")
+        if nm is not None and getattr(nm, "is_nested", False) and len(nm.tensors) == 2:
+            v_mask, a_mask = nm.unbind()
+            v_mask = comfy.utils.common_upscale(v_mask, tw // 16, th // 16, "nearest-exact", "disabled")
+            out["noise_mask"] = comfy.nested_tensor.NestedTensor((v_mask, a_mask))
+        else:
+            out.pop("noise_mask", None)
+        return io.NodeOutput(out)
+
+
 class MiniMaxH3Regenerate(io.ComfyNode):
     """Local in-context regenerate from a previous H3 AV sample (Ref2VA path)."""
 
@@ -294,6 +337,7 @@ class MiniMaxH3UpscaleExtension(ComfyExtension):
         return [
             MiniMaxH3EncodeAV,
             MiniMaxH3UpscaleLatent,
+            MiniMaxH3DownscaleLatent,
             MiniMaxH3Regenerate,
         ]
 
