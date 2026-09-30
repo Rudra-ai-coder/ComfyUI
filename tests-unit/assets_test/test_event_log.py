@@ -34,6 +34,8 @@ VALID_VALUES: dict[str, list[object]] = {
     "hash_failed": [2],
     "enrich_failed": [0],
     "permission_denied": [0],
+    "missing_marked_count": [0, 10],
+    "recovered_count": [10],
     "count": [1],
     "error_type": ["ValueError", "FileNotFoundError"],
     "hashing_enabled": [True, False],
@@ -168,7 +170,9 @@ def test_unknown_field_raises_under_pytest():
         emit("seeder.scan_started", path="/home/x/models")
 
 
-@pytest.mark.parametrize("value", ["a/b", "a\\b", "a:b", "a b", "a=b", 'a"b'])
+@pytest.mark.parametrize(
+    "value", ["a/b", "a\\b", "a:b", "a b", "a=b", 'a"b', "a\nb", "a\rb"]
+)
 def test_a_string_value_carrying_a_forbidden_character_raises(value):
     with pytest.raises(EventLogError):
         emit("seeder.scan_failed", error_type=value)
