@@ -5,6 +5,7 @@ Official H3-Regenerate-2K is not open-sourced. These nodes approximate it:
 - Upscale Latent: spatially upscale a previous AV NestedTensor for a low-sigma refine
 - Downscale Latent: spatially downscale a previous AV NestedTensor (audio unchanged)
 - Temporal Upscale Latent: stretch video and audio time onto a longer 17k+5 clip
+- Temporal Downscale Latent: shorten video and audio time onto a shorter 17k+5 clip
 - Regenerate: decode the previous sample, attach as Ref2VA <Audio 1>/<Video 1>,
   and prepare a target-resolution latent (upscaled or empty)
 
@@ -276,10 +277,32 @@ def _resample_time(x, dim, size, method):
     flat = x.reshape(-1, 1, x.shape[-1]).float()
     if method == "nearest-exact":
         out = torch.nn.functional.interpolate(flat, size=size, mode="nearest-exact")
+    elif method == "area":
+        out = torch.nn.functional.interpolate(flat, size=size, mode="area")
     else:
         out = torch.nn.functional.interpolate(flat, size=size, mode="linear", align_corners=True)
     out = out.to(dtype=x.dtype).reshape(*x.shape[:-1], size)
     return out.movedim(-1, dim)
+
+
+def _apply_temporal_resize(samples, dst_frames, method, name):
+    video, audio = h3._h3_av_tensors(samples["samples"], name)
+    _, dst_t, dst_a = h3.temporal_shape(dst_frames)
+    video_out = _resample_time(video, 2, dst_t, method)
+    audio_out = _resample_time(audio, -1, dst_a, method)
+    out = samples.copy()
+    out["samples"] = comfy.nested_tensor.NestedTensor((video_out, audio_out))
+    out.pop("h3_frozen_video_t", None)
+    out.pop("h3_frozen_audio_t", None)
+    nm = out.get("noise_mask")
+    if nm is not None and getattr(nm, "is_nested", False) and len(nm.tensors) == 2:
+        v_mask, a_mask = nm.unbind()
+        v_mask = _resample_time(v_mask, 2, dst_t, "nearest-exact")
+        a_mask = _resample_time(a_mask, -1, dst_a, "nearest-exact")
+        out["noise_mask"] = comfy.nested_tensor.NestedTensor((v_mask, a_mask))
+    else:
+        out.pop("noise_mask", None)
+    return out
 
 
 class MiniMaxH3TemporalUpscaleLatent(io.ComfyNode):
@@ -306,29 +329,50 @@ class MiniMaxH3TemporalUpscaleLatent(io.ComfyNode):
 
     @classmethod
     def execute(cls, samples, scale_by, length, upscale_method) -> io.NodeOutput:
-        video, audio = h3._h3_av_tensors(samples["samples"], "MiniMax H3 Temporal Upscale Latent")
+        video, _ = h3._h3_av_tensors(samples["samples"], "MiniMax H3 Temporal Upscale Latent")
         src_frames = h3._pixel_frames_from_latent_t(video.shape[2])
         if length > 0:
             dst_frames = _nearest_frame_count(length)
         else:
             dst_frames = _nearest_frame_count(src_frames * scale_by)
         dst_frames = max(dst_frames, src_frames)
-        _, dst_t, dst_a = h3.temporal_shape(dst_frames)
-        video_up = _resample_time(video, 2, dst_t, upscale_method)
-        audio_up = _resample_time(audio, -1, dst_a, upscale_method)
-        out = samples.copy()
-        out["samples"] = comfy.nested_tensor.NestedTensor((video_up, audio_up))
-        out.pop("h3_frozen_video_t", None)
-        out.pop("h3_frozen_audio_t", None)
-        nm = out.get("noise_mask")
-        if nm is not None and getattr(nm, "is_nested", False) and len(nm.tensors) == 2:
-            v_mask, a_mask = nm.unbind()
-            v_mask = _resample_time(v_mask, 2, dst_t, "nearest-exact")
-            a_mask = _resample_time(a_mask, -1, dst_a, "nearest-exact")
-            out["noise_mask"] = comfy.nested_tensor.NestedTensor((v_mask, a_mask))
+        return io.NodeOutput(_apply_temporal_resize(
+            samples, dst_frames, upscale_method, "MiniMax H3 Temporal Upscale Latent"))
+
+
+class MiniMaxH3TemporalDownscaleLatent(io.ComfyNode):
+    """Shorten an H3 AV latent by resampling time. Decode stays 24 fps."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3TemporalDownscaleLatent",
+            display_name="MiniMax H3 Temporal Downscale Latent",
+            search_aliases=["minimax temporal downscale", "h3 shorter latent", "minimax shrink time"],
+            category="model/latent/minimax",
+            description="Resample a MiniMax H3 AV latent onto a shorter 17k+5 clip. Audio is shortened with the video so they stay in sync.",
+            inputs=[
+                io.Latent.Input("samples", tooltip="H3 AV NestedTensor latent (video + audio)"),
+                io.Float.Input("scale_by", default=0.5, min=0.125, max=1.0, step=0.125,
+                    tooltip="Duration multiplier when length is 0. Snapped to the nearest 17k+5 frame count, and never longer than the input."),
+                io.Int.Input("length", default=0, min=0, max=3600, step=17,
+                    tooltip="Target frame count at 24 fps (0 = use scale_by). Snapped to the 17k+5 grid."),
+                io.Combo.Input("downscale_method", options=["area", "linear", "nearest-exact"], default="area"),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, scale_by, length, downscale_method) -> io.NodeOutput:
+        video, _ = h3._h3_av_tensors(samples["samples"], "MiniMax H3 Temporal Downscale Latent")
+        src_frames = h3._pixel_frames_from_latent_t(video.shape[2])
+        if length > 0:
+            dst_frames = _nearest_frame_count(length)
         else:
-            out.pop("noise_mask", None)
-        return io.NodeOutput(out)
+            dst_frames = _nearest_frame_count(src_frames * scale_by)
+        dst_frames = min(dst_frames, src_frames)
+        return io.NodeOutput(_apply_temporal_resize(
+            samples, dst_frames, downscale_method, "MiniMax H3 Temporal Downscale Latent"))
 
 
 class MiniMaxH3Regenerate(io.ComfyNode):
@@ -409,6 +453,7 @@ class MiniMaxH3UpscaleExtension(ComfyExtension):
             MiniMaxH3UpscaleLatent,
             MiniMaxH3DownscaleLatent,
             MiniMaxH3TemporalUpscaleLatent,
+            MiniMaxH3TemporalDownscaleLatent,
             MiniMaxH3Regenerate,
         ]
 

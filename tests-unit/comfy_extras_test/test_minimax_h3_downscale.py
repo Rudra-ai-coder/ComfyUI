@@ -2,7 +2,11 @@ import torch
 
 import comfy.nested_tensor
 from comfy_extras.nodes_minimax_h3 import _empty_av_latent, temporal_shape, video_latent_t
-from comfy_extras.nodes_minimax_h3_upscale import MiniMaxH3DownscaleLatent, MiniMaxH3TemporalUpscaleLatent
+from comfy_extras.nodes_minimax_h3_upscale import (
+    MiniMaxH3DownscaleLatent,
+    MiniMaxH3TemporalDownscaleLatent,
+    MiniMaxH3TemporalUpscaleLatent,
+)
 
 
 def test_downscale_halves_spatial_keeps_time_and_audio():
@@ -49,6 +53,29 @@ def test_temporal_upscale_doubles_duration_on_frame_grid():
     assert dst_t == video_latent_t(dst_frames)
     assert v.shape[2] == dst_t
     assert a.shape[-1] == dst_a
+    torch.testing.assert_close(v[:, :, 0], video[:, :, 0])
+    torch.testing.assert_close(v[:, :, -1], video[:, :, -1])
+    torch.testing.assert_close(a[..., 0], audio[..., 0])
+    torch.testing.assert_close(a[..., -1], audio[..., -1])
+
+
+def test_temporal_downscale_halves_duration_on_frame_grid():
+    latent, frames = _empty_av_latent(64, 64, 124)
+    video, audio = latent["samples"].unbind()
+    video = video.clone()
+    video[:, :, 0] = 1
+    video[:, :, -1] = 9
+    audio = audio.clone()
+    audio[..., 0] = 2
+    audio[..., -1] = 8
+    latent["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
+
+    out = MiniMaxH3TemporalDownscaleLatent.execute(latent, 0.5, 0, "linear").result[0]
+    v, a = out["samples"].unbind()
+    dst_frames = min(frames, 17 * round((frames * 0.5 - 5) / 17) + 5)
+    _, dst_t, dst_a = temporal_shape(dst_frames)
+    assert v.shape[2] == dst_t < video.shape[2]
+    assert a.shape[-1] == dst_a < audio.shape[-1]
     torch.testing.assert_close(v[:, :, 0], video[:, :, 0])
     torch.testing.assert_close(v[:, :, -1], video[:, :, -1])
     torch.testing.assert_close(a[..., 0], audio[..., 0])
