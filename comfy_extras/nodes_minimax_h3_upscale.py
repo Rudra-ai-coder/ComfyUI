@@ -4,6 +4,7 @@ Official H3-Regenerate-2K is not open-sourced. These nodes approximate it:
 - Encode AV: IMAGE frames + AUDIO -> NestedTensor AV latent
 - Upscale Latent: spatially upscale a previous AV NestedTensor for a low-sigma refine
 - Downscale Latent: spatially downscale a previous AV NestedTensor (audio unchanged)
+- Temporal Upscale Latent: stretch video and audio time onto a longer 17k+5 clip
 - Regenerate: decode the previous sample, attach as Ref2VA <Audio 1>/<Video 1>,
   and prepare a target-resolution latent (upscaled or empty)
 
@@ -261,6 +262,75 @@ class MiniMaxH3DownscaleLatent(io.ComfyNode):
         return io.NodeOutput(out)
 
 
+def _nearest_frame_count(n):
+    """Closest duration on the H3 17k+5 grid (5, 22, 39, ...)."""
+    n = max(5, int(round(n)))
+    k = max(0, round((n - 5) / 17))
+    return 17 * k + 5
+
+
+def _resample_time(x, dim, size, method):
+    if x.shape[dim] == size:
+        return x
+    x = x.movedim(dim, -1)
+    flat = x.reshape(-1, 1, x.shape[-1]).float()
+    if method == "nearest-exact":
+        out = torch.nn.functional.interpolate(flat, size=size, mode="nearest-exact")
+    else:
+        out = torch.nn.functional.interpolate(flat, size=size, mode="linear", align_corners=True)
+    out = out.to(dtype=x.dtype).reshape(*x.shape[:-1], size)
+    return out.movedim(-1, dim)
+
+
+class MiniMaxH3TemporalUpscaleLatent(io.ComfyNode):
+    """Lengthen an H3 AV latent by interpolating time. Decode stays 24 fps."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3TemporalUpscaleLatent",
+            display_name="MiniMax H3 Temporal Upscale Latent",
+            search_aliases=["minimax temporal", "h3 frame interpolate", "minimax longer latent"],
+            category="model/latent/minimax",
+            description="Interpolate a MiniMax H3 AV latent onto a longer 17k+5 clip. Audio is stretched with the video so they stay in sync. A low-denoise pass fills the new frames.",
+            inputs=[
+                io.Latent.Input("samples", tooltip="H3 AV NestedTensor latent (video + audio)"),
+                io.Float.Input("scale_by", default=2.0, min=1.0, max=8.0, step=0.5,
+                    tooltip="Duration multiplier when length is 0. Snapped to the nearest 17k+5 frame count."),
+                io.Int.Input("length", default=0, min=0, max=3600, step=17,
+                    tooltip="Target frame count at 24 fps (0 = use scale_by). Snapped to the 17k+5 grid."),
+                io.Combo.Input("upscale_method", options=["linear", "nearest-exact"], default="linear"),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, samples, scale_by, length, upscale_method) -> io.NodeOutput:
+        video, audio = h3._h3_av_tensors(samples["samples"], "MiniMax H3 Temporal Upscale Latent")
+        src_frames = h3._pixel_frames_from_latent_t(video.shape[2])
+        if length > 0:
+            dst_frames = _nearest_frame_count(length)
+        else:
+            dst_frames = _nearest_frame_count(src_frames * scale_by)
+        dst_frames = max(dst_frames, src_frames)
+        _, dst_t, dst_a = h3.temporal_shape(dst_frames)
+        video_up = _resample_time(video, 2, dst_t, upscale_method)
+        audio_up = _resample_time(audio, -1, dst_a, upscale_method)
+        out = samples.copy()
+        out["samples"] = comfy.nested_tensor.NestedTensor((video_up, audio_up))
+        out.pop("h3_frozen_video_t", None)
+        out.pop("h3_frozen_audio_t", None)
+        nm = out.get("noise_mask")
+        if nm is not None and getattr(nm, "is_nested", False) and len(nm.tensors) == 2:
+            v_mask, a_mask = nm.unbind()
+            v_mask = _resample_time(v_mask, 2, dst_t, "nearest-exact")
+            a_mask = _resample_time(a_mask, -1, dst_a, "nearest-exact")
+            out["noise_mask"] = comfy.nested_tensor.NestedTensor((v_mask, a_mask))
+        else:
+            out.pop("noise_mask", None)
+        return io.NodeOutput(out)
+
+
 class MiniMaxH3Regenerate(io.ComfyNode):
     """Local in-context regenerate from a previous H3 AV sample (Ref2VA path)."""
 
@@ -338,6 +408,7 @@ class MiniMaxH3UpscaleExtension(ComfyExtension):
             MiniMaxH3EncodeAV,
             MiniMaxH3UpscaleLatent,
             MiniMaxH3DownscaleLatent,
+            MiniMaxH3TemporalUpscaleLatent,
             MiniMaxH3Regenerate,
         ]
 
