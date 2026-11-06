@@ -16,3 +16,6 @@ If **Need pricing update**:
 ### QA
 - [ ] **QA done**
 - [ ] **QA not required**
+
+### Comms
+- [ ] Informed **Kosinkadink**

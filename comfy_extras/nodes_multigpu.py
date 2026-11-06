@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from inspect import cleandoc
 from typing import TYPE_CHECKING
@@ -318,7 +319,10 @@ class SelectVAEDeviceNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, vae: VAE, device: str = "default") -> io.NodeOutput:
-        vae = vae.clone()
+        # VAE has no .clone(); shallow-copy the wrapper and clone the patcher
+        # so we can retarget load/offload device without affecting the input VAE.
+        vae = copy.copy(vae)
+        vae.patcher = vae.patcher.clone()
         resolved = comfy.model_management.resolve_gpu_device_option(device)
         if resolved is None and device not in (None, "default"):
             logging.info(f"Select VAE Device: requested device '{device}' not available, passing through unchanged.")
@@ -326,6 +330,8 @@ class SelectVAEDeviceNode(io.ComfyNode):
         if resolved is not None and resolved.type == "cpu":
             logging.info("Select VAE Device: CPU is not a supported choice, passing through unchanged.")
             return io.NodeOutput(vae)
+        if not hasattr(vae, "_select_base_device"):
+            vae._select_base_device = vae.device
         try:
             vae.patcher = _apply_patcher_device(
                 vae.patcher, resolved,
@@ -337,7 +343,7 @@ class SelectVAEDeviceNode(io.ComfyNode):
         # Keep VAE wrapper in sync with whatever model the patcher now owns;
         # deepclone_multigpu may have produced a fresh first_stage_model.
         vae.first_stage_model = vae.patcher.model
-        vae.device = vae.patcher.load_device
+        vae.device = vae._select_base_device if resolved is None else resolved
         return io.NodeOutput(vae)
 
 

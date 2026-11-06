@@ -272,7 +272,6 @@ class Ideogram45Request(BaseModel):
     seed: int = Field(..., ge=0, le=2147483647)
     size: str | None = None
     magic_prompt: str | None = None
-    context_window: str | None = None
 
 
 class IdeogramVectorGenerateRequest(BaseModel):

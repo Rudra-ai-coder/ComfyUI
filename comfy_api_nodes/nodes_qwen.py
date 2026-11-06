@@ -14,12 +14,14 @@ from comfy_api_nodes.apis.qwen import (
     QwenImageParametersField,
 )
 from comfy_api_nodes.util import (
+    ApiEndpoint,
     download_url_to_image_tensor,
-    router_op,
+    sync_op,
     tensor_to_base64_string,
     validate_string,
 )
 
+GENERATION_PATH = "/proxy/qwen/api/v1/services/aigc/multimodal-generation/generation"
 QWEN_IMAGE_MODELS = ["qwen-image-3.0-pro", "qwen-image-3.0"]
 MIN_AREA = 262144  # 512*512
 MAX_AREA = 6553600  # 2560*2560
@@ -265,9 +267,9 @@ class QwenImageTextToImageApi(IO.ComfyNode):
         validate_string(model["prompt"], strip_whitespace=False, min_length=1)
         width, height = model["width"], model["height"]
         _validate_size(width, height)
-        response = await router_op(
+        response = await sync_op(
             cls,
-            f"qwen/{model['model']}",
+            ApiEndpoint(path=GENERATION_PATH, method="POST"),
             response_model=QwenImageGenerationResponse,
             data=QwenImageGenerationRequest(
                 model=model["model"],
@@ -407,9 +409,9 @@ class QwenImageEditApi(IO.ComfyNode):
             size_str = None
         content = [QwenImageContentItem(image=_image_data_uri(image)) for image in reference_images]
         content.append(QwenImageContentItem(text=prompt))
-        response = await router_op(
+        response = await sync_op(
             cls,
-            f"qwen/{model['model']}",
+            ApiEndpoint(path=GENERATION_PATH, method="POST"),
             response_model=QwenImageGenerationResponse,
             data=QwenImageGenerationRequest(
                 model=model["model"],

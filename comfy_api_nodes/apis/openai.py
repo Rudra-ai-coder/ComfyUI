@@ -26,7 +26,6 @@ class OpenAIImageGenerationResponse(BaseModel):
 
 class OpenAIImageEditRequest(BaseModel):
     background: str | None = Field(None, description="Background transparency")
-    complexity: str | None = Field(None)
     model: str = Field(...)
     moderation: str | None = Field(None)
     n: int | None = Field(None, description="The number of images to generate")
@@ -39,7 +38,6 @@ class OpenAIImageEditRequest(BaseModel):
 
 class OpenAIImageGenerationRequest(BaseModel):
     background: str | None = Field(None, description="Background transparency")
-    complexity: str | None = Field(None)
     model: str | None = Field(None)
     moderation: str | None = Field(None)
     n: int | None = Field(
